@@ -22,8 +22,16 @@ AskUserQuestion:
 
 Use the answers to create the okrs feature group with 'target' and 'value' columns. Create a DataFrame with the following data: "features/models/model deployments/agent deployments/apps/dashboards" as the 'target' entries and the 'value' entries being the numerical answer provided by the user.
 
+After the okrs feature group has been created and populated, build the executive dashboard by running 'create_executive_dashboard.py'. This reads the targets from the okrs feature group and pairs each one against its live actual, computed from the real hopsworks metadata tables via the mysql_hopsworks JDBC connection in Superset (no Trino). Re-run it after the OKR targets change to refresh them.
+
 
 Then, you want to
 AskUserQuestion:
 Can we schedule a daily job to update the schematized tags in the system?
 If the user answers yes, create a Python job to run 'create_tag_dataset.py' once/day by default at 04.00. Use 1 CPU and 4 GB of memory in the job.
+
+
+AskUserQuestion:
+Do you want to create the dashboards now (executive, developer, others)?
+
+If the user answers yes, then run the python programs to create the dashboards (create_tag_dataset.py, create_executive_dashboard.py, feature_usage_dashboard.py, etc).

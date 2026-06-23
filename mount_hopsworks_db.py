@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 import warnings
 
 import hopsworks
@@ -45,6 +46,10 @@ warnings.filterwarnings("ignore")
 SOURCE_DB = "hopsworks"
 CONNECTOR = "mysql_hopsworks"
 VERSION = 1
+
+# Retry policy for transient LLM inference 500s (errorCode 520013).
+INFER_RETRIES = 4
+INFER_BACKOFF = 3  # seconds; multiplied by attempt number (3s, 6s, 9s, ...)
 
 # The exact list the user provided (table names concatenated, no separators).
 REQUESTED_BLOB = (
@@ -177,7 +182,39 @@ def features_from_inference(table_ds, tname: str) -> tuple[list[Feature], list[s
         PlatformIntelligenceException: if platform intelligence is not enabled on
         the cluster, or the LLM call fails.
     """
-    inferred = table_ds.infer_metadata()
+    # SDK workaround: DataSourceData.from_response_json leaves `features` as a
+    # list of dicts (it never deserializes them into Feature objects), so the
+    # SDK's _infer_metadata raises AttributeError('dict' has no attribute 'name')
+    # on the very first table. Fetch the preview ourselves and coerce the dict
+    # features into Feature objects before handing them to infer_metadata.
+    preview = table_ds.get_data()
+    # The preview backend returns no features for an empty table (0 rows), and
+    # the inference backend then deterministically 500s (errorCode 520013) with
+    # nothing to sample. Skip the doomed LLM call (and its retries) and let the
+    # caller fall back to schema introspection / information_schema.
+    if not preview.features:
+        raise PlatformIntelligenceException(
+            PlatformIntelligenceException.INFERENCE_FAILED,
+            "preview returned no features — cannot infer metadata from an empty table",
+        )
+    if isinstance(preview.features[0], dict):
+        preview._features = [
+            Feature(name=f["name"], type=f.get("type") or "string")
+            for f in preview.features
+        ]
+    # The LLM backend intermittently 500s (errorCode 520013, surfaced as
+    # INFERENCE_FAILED) under load — retry a few times with backoff before
+    # letting the caller fall back to introspection for this table. A
+    # NOT_CONFIGURED verdict is not transient, so it propagates immediately.
+    for attempt in range(INFER_RETRIES):
+        try:
+            inferred = table_ds.infer_metadata(preview_data=preview)
+            break
+        except PlatformIntelligenceException as exc:
+            if (exc.reason != PlatformIntelligenceException.INFERENCE_FAILED
+                    or attempt == INFER_RETRIES - 1):
+                raise
+            time.sleep(INFER_BACKOFF * (attempt + 1))
 
     features, taken, name_map = [], set(), {}
     for f in inferred.features:
