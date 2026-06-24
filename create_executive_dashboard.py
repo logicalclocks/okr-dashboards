@@ -476,18 +476,26 @@ def chart_specs(targets):
         12, 50,
     ))
 
-    # 3f. Pipeline Lifecycle Funnel (feature groups): feature counts by asset
-    #     status, in lifecycle order untagged -> rnd -> uat -> qa -> prod (kept by
-    #     numbered stage labels + sort_by_metric off). From fg_lifecycle_funnel.
+    # 3f. Pipeline Lifecycle "funnel" (feature groups): feature counts by asset
+    #     status, as a HORIZONTAL bar with categories pinned in lifecycle order
+    #     untagged -> rnd -> uat -> qa -> prod. Bars are ordered by the numeric
+    #     sort_order (order_desc off + orderby on MIN(sort_order)), not by size;
+    #     the numbered stage labels keep the order unambiguous. From
+    #     fg_lifecycle_funnel.
     specs.append((
-        FG_FUNNEL_CHART, "funnel",
-        {"viz_type": "funnel", "groupby": ["stage"],
-         "metric": {"expressionType": "SQL", "sqlExpression": "SUM(cnt)",
-                    "label": "features", "optionName": "m_funnel",
-                    "hasCustomLabel": True},
-         "adhoc_filters": [], "row_limit": 10, "sort_by_metric": False,
-         "number_format": "SMART_NUMBER", "show_legend": True,
-         "tooltip_label_contents": ["key", "value", "percent"]},
+        FG_FUNNEL_CHART, "echarts_timeseries_bar",
+        {"viz_type": "echarts_timeseries_bar", "x_axis": "stage",
+         "x_axis_force_categorical": True,
+         "metrics": [{"expressionType": "SQL", "sqlExpression": "SUM(cnt)",
+                      "label": "features", "optionName": "m_funnel",
+                      "hasCustomLabel": True}],
+         "groupby": [], "adhoc_filters": [], "orientation": "horizontal",
+         "row_limit": 10, "order_desc": False,
+         "orderby": [[{"expressionType": "SQL", "sqlExpression": "MIN(sort_order)",
+                       "label": "stage_order", "hasCustomLabel": True}, True]],
+         "x_axis_sort": "stage", "x_axis_sort_asc": True,
+         "show_legend": False, "show_value": True, "truncateYAxis": False,
+         "y_axis_format": ",d"},
         6, 50,
     ))
 
