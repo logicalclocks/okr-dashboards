@@ -18,12 +18,12 @@ This program builds TWO datasets + dashboards from those tables:
 
   1. OVERVIEW (wide) — `feature_store_tags_denormalized`: ONE ROW PER ARTIFACT,
      pivoting every tag value into its own typed `<tag>_<field>` column. Drives
-     the "Feature Store Tags Overview" dashboard (browse each asset's tags;
+     the "Tag Details" dashboard (browse each asset's tags;
      per-field value distributions; detail table).
 
   2. BREAKDOWN (tall) — `feature_store_tags_by_value`: ONE ROW PER
      (asset × tag-field value), unfolding tag values into rows. Drives the
-     "Feature Store Tags — Asset Breakdown" dashboard (counts of instances per
+     "Tag Summary" dashboard (counts of instances per
      tag value, split by asset type, totalled over all asset types).
 
 Both are idempotent (list-then-create/update, replace-charts-by-name) and have
@@ -41,7 +41,7 @@ SCHEMA = "hopsworks"                        # MySQL schema holding the tag table
 
 # --- OVERVIEW (wide / one row per artifact) --------------------------------- #
 DENORM_DATASET = "feature_store_tags_denormalized"
-OVERVIEW_TITLE = "Feature Store Tags Overview"
+OVERVIEW_TITLE = "Tag Details"
 OVERVIEW_PREFIX = "Tags · "                 # namespaces charts for idempotency
 # Identity columns always present in the denormalized dataset.
 ID_COLS = ["artifact_type", "artifact_name", "artifact_version",
@@ -49,7 +49,7 @@ ID_COLS = ["artifact_type", "artifact_name", "artifact_version",
 
 # --- BREAKDOWN (tall / one row per asset × value) --------------------------- #
 BREAKDOWN_DATASET = "feature_store_tags_by_value"
-BREAKDOWN_TITLE = "Feature Store Tags — Asset Breakdown"
+BREAKDOWN_TITLE = "Tag Summary"
 BREAKDOWN_PREFIX = "Tag Breakdown · "       # namespaces charts for idempotency
 
 COUNT_METRIC = {

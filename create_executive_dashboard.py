@@ -23,7 +23,8 @@ This program:
   1. reads the OKR targets from the `okrs` feature group,
   2. builds a virtual (SQL) dataset on the mysql_hopsworks connection that
      UNIONs one row per OKR: metric, target, live actual, pct-to-target, status,
-  3. creates/updates gauge + bar + table charts and assembles the dashboard.
+  3. creates/updates KPI + bar + per-OKR progress-bar + table charts and
+     assembles the dashboard.
 
 Run:  python create_executive_dashboard.py
 """
@@ -39,6 +40,28 @@ DATASET_NAME = "okr_progress"
 DASHBOARD_TITLE = "Executive OKR Dashboard"
 CHART_PREFIX = "OKR · "                     # namespaces charts for idempotency
 
+# Charts that used to be on the dashboard but have been removed. Deleted from
+# Superset on every run so re-running this program cleans them up.
+RETIRED_CHARTS = [
+    f"{CHART_PREFIX}Target vs Actual",
+    f"{CHART_PREFIX}features — % to target",
+    f"{CHART_PREFIX}Feature OKR Progression",          # renamed -> (current/target)
+    f"{CHART_PREFIX}Models OKR Progression (current/target)",  # -> Feature Views KPI
+    f"{CHART_PREFIX}Features vs Target (stacked)",      # renamed -> Feature Counts (stacked)
+    f"{CHART_PREFIX}Feature Views vs Target (stacked)",  # renamed -> Features used in Models
+    f"{CHART_PREFIX}Feature Views OKR Progression (current/target)",   # removed
+    f"{CHART_PREFIX}Model Deployments OKR Progression (current/target)",   # removed
+    f"{CHART_PREFIX}Agent Deployments OKR Progression (current/target)",   # removed
+    f"{CHART_PREFIX}Overall Progress",   # removed
+    f"{CHART_PREFIX}OKRs On Track",   # removed
+    f"{CHART_PREFIX}Active Feature OKR Progression (current/target)",  # -> Active Feature Count
+    f"{CHART_PREFIX}Feature OKR Progression (current/target)",  # -> Prod Feature Count
+    f"{CHART_PREFIX}Feature Counts (stacked)",  # -> Feature Count Details
+    f"{CHART_PREFIX}Features used in Models (feature views)",  # earlier rename
+    f"{CHART_PREFIX}Features used in Models",  # removed
+    f"{CHART_PREFIX}Pipeline Lifecycle Funnel — Feature Groups",  # -> for Features
+]
+
 # Live MySQL actual for each OKR metric: a scalar SQL expression counting the
 # real Hopsworks metadata rows. Keyed by the metric name stored in the `okrs`
 # FG. `apps` has no table in the metadata DB, so its actual is the literal 0.
@@ -53,18 +76,180 @@ ACTUAL_SQL = {
     "apps": "(SELECT COUNT(*) FROM hopsworks.jobs WHERE type = 'PYTHON_APP')",
 }
 
-MAX_PCT = {
-    "expressionType": "SQL", "sqlExpression": "MAX(pct_to_target)",
-    "label": "pct_to_target", "optionName": "metric_pct", "hasCustomLabel": True,
-}
-MAX_TARGET = {
-    "expressionType": "SQL", "sqlExpression": "MAX(target)",
-    "label": "target", "optionName": "metric_target", "hasCustomLabel": True,
-}
-MAX_ACTUAL = {
-    "expressionType": "SQL", "sqlExpression": "MAX(actual)",
-    "label": "actual", "optionName": "metric_actual", "hasCustomLabel": True,
-}
+# The `asset` tag carries one lifecycle value per feature group in
+# its `status` field (enum: deprecated / prod / rnd / uat), e.g.
+# {"status":"prod"}. fg_status is NULL for feature groups with no such tag.
+# Joined by tag name (not a hard-coded schema id) so it survives re-registration.
+FG_STATUS_SQL = (
+    "SELECT tv.feature_group_id,"
+    " JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS fg_status"
+    " FROM hopsworks.feature_store_tag_value tv"
+    " JOIN hopsworks.feature_store_tag t"
+    "   ON t.id = tv.schema_id AND t.name = 'asset'"
+    " WHERE tv.feature_group_id IS NOT NULL"
+)
+
+# One row per feature, carrying its feature group's `asset` value
+# (fg_status). Drives the feature KPI panels by COUNTing rows filtered on
+# fg_status: 'prod' for the prod-feature KPI, "not deprecated" for the
+# active-feature KPI.
+#
+# IMPORTANT: the per-feature link columns hold the *subtype* id, not
+# feature_group.id — cached_feature.cached_feature_group_id matches
+# feature_group.cached_feature_group_id (and likewise stream_feature_group_id),
+# on_demand_feature.on_demand_feature_group_id matches
+# feature_group.on_demand_feature_group_id. We resolve each feature to its
+# feature_group.id (fg_id) through those subtype links, then LEFT JOIN the tag
+# value on fg_id. (Tags live on feature_group.id, so joining the subtype id
+# directly silently matches nothing.)
+FEATURE_STATUS_DATASET = "feature_okr_status"
+FEATURE_STATUS_SQL = f"""SELECT feature_id, feature_kind, s.fg_status FROM (
+    SELECT cf.id AS feature_id, 'cached' AS feature_kind, fg.id AS fg_id
+    FROM hopsworks.cached_feature cf
+    JOIN hopsworks.feature_group fg
+      ON (cf.cached_feature_group_id IS NOT NULL
+          AND fg.cached_feature_group_id = cf.cached_feature_group_id)
+      OR (cf.stream_feature_group_id IS NOT NULL
+          AND fg.stream_feature_group_id = cf.stream_feature_group_id)
+    UNION ALL
+    SELECT odf.id, 'on_demand', fg.id
+    FROM hopsworks.on_demand_feature odf
+    JOIN hopsworks.feature_group fg
+      ON fg.on_demand_feature_group_id = odf.on_demand_feature_group_id
+    UNION ALL
+    SELECT ef.id, 'embedding', e.feature_group_id
+    FROM hopsworks.embedding_feature ef
+    JOIN hopsworks.embedding e ON e.id = ef.embedding_id
+) feats
+LEFT JOIN ({FG_STATUS_SQL}) s ON s.feature_group_id = feats.fg_id"""
+
+
+# One row per feature view + its own asset tag value (fv_status,
+# NULL when the FV carries no such tag). The tag can be attached to a feature
+# view via feature_store_tag_value.feature_view_id, mirroring the FG case.
+FV_STATUS_SQL = """SELECT fv.id AS fv_id, s.fv_status
+FROM hopsworks.feature_view fv
+LEFT JOIN (
+    SELECT tv.feature_view_id,
+           JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS fv_status
+    FROM hopsworks.feature_store_tag_value tv
+    JOIN hopsworks.feature_store_tag t
+      ON t.id = tv.schema_id AND t.name = 'asset'
+    WHERE tv.feature_view_id IS NOT NULL
+) s ON s.feature_view_id = fv.id"""
+# Backs the "Production Model Progression" KPI: COUNT(*) WHERE fv_status='prod'
+# is the number of feature views tagged asset='prod'.
+FV_STATUS_DATASET = "fv_status"
+
+# One row per FEATURE that appears in a feature view, carrying that feature
+# view's asset value (fv_status). training_dataset_feature lists
+# each feature column of a feature view (feature_view_id set); we attach the
+# view's status. Used to count features-in-feature-views by status (not the
+# number of feature views).
+FV_FEATURE_STATUS_SQL = f"""SELECT tdf.id AS feature_id, fvs.fv_status
+FROM hopsworks.training_dataset_feature tdf
+JOIN ({FV_STATUS_SQL}) fvs ON fvs.fv_id = tdf.feature_view_id
+WHERE tdf.feature_view_id IS NOT NULL"""
+
+# Daily time series of features added to feature views tagged asset='prod'. Each
+# feature column of a prod-tagged feature view is binned by that view's creation
+# day (feature_view.created — the moment the feature was added to a view). The
+# window function builds the running cumulative total. Columns: day, daily_count,
+# cumulative_count — backing the "Historical Feature Reuse" line chart.
+FEATURE_REUSE_DATASET = "feature_reuse_daily"
+FEATURE_REUSE_SQL = """SELECT day, daily_count,
+    SUM(daily_count) OVER (ORDER BY day) AS cumulative_count
+FROM (
+    SELECT DATE(fv.created) AS day, COUNT(*) AS daily_count
+    FROM hopsworks.training_dataset_feature tdf
+    JOIN hopsworks.feature_view fv ON fv.id = tdf.feature_view_id
+    WHERE tdf.feature_view_id IS NOT NULL
+      AND fv.id IN (
+        SELECT tv.feature_view_id FROM hopsworks.feature_store_tag_value tv
+        JOIN hopsworks.feature_store_tag t
+          ON t.id = tv.schema_id AND t.name = 'asset'
+        WHERE tv.feature_view_id IS NOT NULL
+          AND JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) = 'prod')
+    GROUP BY DATE(fv.created)
+) d
+ORDER BY day"""
+
+# Feature counts grouped by their feature group's asset `status`, arranged in
+# lifecycle order untagged -> rnd -> uat -> qa -> prod for a funnel chart. Stage
+# labels are numbered so the funnel keeps this exact order (funnels otherwise
+# re-sort by count); 'qa' is included even though it is not in the asset enum
+# (shows 0 until used), and 'deprecated' is intentionally excluded.
+FG_FUNNEL_DATASET = "fg_lifecycle_funnel"
+FG_FUNNEL_STAGES = [
+    ("untagged", "fs.fg_status IS NULL"),
+    ("rnd", "fs.fg_status = 'rnd'"),
+    ("uat", "fs.fg_status = 'uat'"),
+    ("qa", "fs.fg_status = 'qa'"),
+    ("prod", "fs.fg_status = 'prod'"),
+]
+
+
+def build_fg_funnel_sql():
+    rows = []
+    for i, (name, cond) in enumerate(FG_FUNNEL_STAGES, 1):
+        cnt = f"(SELECT COUNT(*) FROM ({FEATURE_STATUS_SQL}) fs WHERE {cond})"
+        rows.append(f"    SELECT {i} AS sort_order, '{i}. {name}' AS stage, "
+                    f"{cnt} AS cnt")
+    union = "\n    UNION ALL\n".join(rows)
+    return f"SELECT sort_order, stage, cnt FROM (\n{union}\n) t ORDER BY sort_order"
+
+
+# Feature popularity: how many distinct feature views each feature is used in.
+# A feature is identified by (name, source feature group) so identically named
+# features from different FGs stay separate; the label carries both. fv_count is
+# an integer (COUNT DISTINCT feature views). Backs the "Most Popular Features"
+# top-20 bar chart.
+FEATURE_POPULARITY_DATASET = "feature_popularity"
+FEATURE_POPULARITY_SQL = """SELECT feature, fv_count FROM (
+    SELECT CONCAT(tdf.name, ' (', COALESCE(fg.name, '?'), ')') AS feature,
+           COUNT(DISTINCT tdf.feature_view_id) AS fv_count
+    FROM hopsworks.training_dataset_feature tdf
+    LEFT JOIN hopsworks.feature_group fg ON fg.id = tdf.feature_group
+    WHERE tdf.feature_view_id IS NOT NULL
+    GROUP BY tdf.name, fg.name
+) t ORDER BY fv_count DESC"""
+
+# Dataset feeding the stacked bar charts. For each population (features, Feature
+# Views) there are two x-axis bars:
+#   bar='actual' — split into non-overlapping segments by asset
+#                  value (deprecated / prod / rnd / uat / untagged, where
+#                  untagged = no such tag). These sum to the live total.
+#   bar='target' — a single separate bar holding that population's OKR target
+#                  (features OKR target for features; models OKR target for
+#                  Feature Views).
+# So the actual breakdown and the target stand side by side rather than the
+# target being a synthetic segment of the actual bar. Counts are live scalar
+# subqueries; targets are embedded at build time. The deprecated segment is
+# hidden by default via a native filter.
+FEATURE_STACK_DATASET = "feature_target_stack"
+STATUS_ENUM = ["deprecated", "prod", "rnd", "uat"]
+
+
+def build_feature_stack_sql(feat_target, fv_target):
+    """Per population: an 'actual' bar stacked by asset value, plus
+    a separate 'target' bar."""
+    def rows(status_sql, alias, metric, target):
+        def cnt(cond):
+            return f"(SELECT COUNT(*) FROM ({status_sql}) {alias} WHERE {cond})"
+        col = f"{alias}.{'fg_status' if alias == 'fs' else 'fv_status'}"
+        out = [(metric, "actual", s, cnt(f"{col} = '{s}'")) for s in STATUS_ENUM]
+        # untagged: no asset tag at all (LEFT JOIN leaves it NULL).
+        out.append((metric, "actual", "untagged", cnt(f"{col} IS NULL")))
+        out.append((metric, "target", "target", str(int(target))))
+        return out
+
+    all_rows = (rows(FEATURE_STATUS_SQL, "fs", "features", feat_target)
+                + rows(FV_FEATURE_STATUS_SQL, "vs", "Feature Views", fv_target))
+    union = "\n    UNION ALL\n".join(
+        f"    SELECT '{metric}' AS metric, '{bar}' AS bar,"
+        f" '{seg}' AS segment, ({val}) AS value"
+        for metric, bar, seg, val in all_rows)
+    return f"SELECT metric, bar, segment, value FROM (\n{union}\n) s"
 
 
 def find_mysql_db_id(api):
@@ -158,68 +343,171 @@ def list_all(api, resource):
     return items
 
 
-def metric_filter(metric):
-    esc = metric.replace("'", "''")
-    return [{"expressionType": "SQL",
-             "sqlExpression": f"metric = '{esc}'", "clause": "WHERE"}]
+def sql_filter(expr):
+    """A single ad-hoc WHERE filter from a raw SQL boolean expression."""
+    return [{"expressionType": "SQL", "sqlExpression": expr, "clause": "WHERE"}]
+
+
+def _tbl_metric(sql, label, opt):
+    return {"expressionType": "SQL", "sqlExpression": sql, "label": label,
+            "optionName": opt, "hasCustomLabel": True}
+
+
+def attainment_table(slice_name, current_sql, target_sql, filters, width=3, height=40):
+    """A one-row KPI table: Current | Target | % attainment, all live.
+
+    % attainment is current/target as a fraction, rendered as a percent by
+    column_config. current_sql/target_sql are aggregate SQL expressions evaluated
+    over the (filtered) dataset, so every cell refreshes with the live data.
+    """
+    pct_sql = f"({current_sql}) / NULLIF(({target_sql}), 0)"
+    params = {
+        "viz_type": "table", "query_mode": "aggregate", "groupby": [],
+        "metrics": [
+            _tbl_metric(current_sql, "Current", "m_current"),
+            _tbl_metric(target_sql, "Target", "m_target"),
+            _tbl_metric(pct_sql, "% attainment", "m_pct"),
+        ],
+        "adhoc_filters": filters, "row_limit": 1, "show_cell_bars": False,
+        "column_config": {
+            "Current": {"d3NumberFormat": ",d"},
+            "Target": {"d3NumberFormat": ",d"},
+            "% attainment": {"d3NumberFormat": ".1%"},
+        },
+        "conditional_formatting": [
+            {"column": "% attainment", "operator": ">", "targetValue": 0,
+             "colorScheme": "#5AC189"},
+        ],
+        "table_timestamp_format": "smart_date",
+    }
+    return (slice_name, "table", params, width, height)
+
+
+# Stacked-bar metric: total of the segment values for each (bucket, segment).
+SUM_VALUE = {
+    "expressionType": "SQL", "sqlExpression": "SUM(value)",
+    "label": "features", "optionName": "metric_value", "hasCustomLabel": True,
+}
+ACTIVE_FEATURE_CHART = f"{CHART_PREFIX}Active Feature Count"
+PROD_FEATURE_CHART = f"{CHART_PREFIX}Prod Feature Count"
+PROD_MODEL_CHART = f"{CHART_PREFIX}Production Model Progression"
+FEATURE_STACK_CHART = f"{CHART_PREFIX}Feature Count Details"
+FEATURE_REUSE_CHART = f"{CHART_PREFIX}Historical Feature Reuse"
+FG_FUNNEL_CHART = f"{CHART_PREFIX}Pipeline Lifecycle Funnel for Features"
+MOST_POPULAR_CHART = f"{CHART_PREFIX}Most Popular Features"
 
 
 def chart_specs(targets):
     """(slice_name, viz_type, params, width, height) list for the dashboard."""
     specs = []
 
-    # 1. Overall progress KPI: average pct-to-target across all OKRs.
-    specs.append((
-        f"{CHART_PREFIX}Overall Progress", "big_number_total",
-        {"viz_type": "big_number_total",
-         "metric": {"expressionType": "SQL",
-                    "sqlExpression": "ROUND(AVG(pct_to_target), 1)",
-                    "label": "avg_pct", "optionName": "metric_avg_pct",
-                    "hasCustomLabel": True},
-         "adhoc_filters": [], "y_axis_format": "SMART_NUMBER",
-         "subheader": "average % of target across all OKRs"},
-        4, 30,
-    ))
+    # Two feature KPI tables, both backed by the feature-grain feature_okr_status
+    #     dataset (handled in main) and counting features against the features OKR
+    #     target. Each shows Current | Target | % attainment (all live). They differ
+    #     only in the fg_status filter on each feature's asset value:
+    #       a) Active  — features in FGs NOT tagged 'deprecated' (incl. untagged).
+    #       b) Feature — features in FGs tagged 'prod'.
+    #     (a) is listed first so it leads the KPI panels.
+    feat_target = int(targets.get("features", 0))
+    specs.append(attainment_table(
+        ACTIVE_FEATURE_CHART, "COUNT(*)", str(feat_target),
+        sql_filter("COALESCE(fg_status, '') <> 'deprecated'")))
+    specs.append(attainment_table(
+        PROD_FEATURE_CHART, "COUNT(*)", str(feat_target),
+        sql_filter("fg_status = 'prod'")))
 
-    # 2. OKRs on track KPI.
-    specs.append((
-        f"{CHART_PREFIX}OKRs On Track", "big_number_total",
-        {"viz_type": "big_number_total",
-         "metric": {"expressionType": "SQL",
-                    "sqlExpression": "SUM(CASE WHEN actual >= target THEN 1 ELSE 0 END)",
-                    "label": "on_track", "optionName": "metric_on_track",
-                    "hasCustomLabel": True},
-         "adhoc_filters": [], "y_axis_format": "SMART_NUMBER",
-         "subheader": f"of {len(targets)} OKRs meeting target"},
-        4, 30,
-    ))
+    # Position 3: Production Model Progression — number of feature views tagged
+    #     asset='prod', against the models OKR target. From the fv_status dataset.
+    specs.append(attainment_table(
+        PROD_MODEL_CHART, "COUNT(*)", str(int(targets.get("models", 0))),
+        sql_filter("fv_status = 'prod'")))
 
-    # 3. Target vs Actual grouped bar across all OKRs.
+    # 3c. Two separate stacked charts (kept apart so the very different target
+    #     scales — features vs feature views — stay readable). Each shows an
+    #     'actual' bar split into non-overlapping asset segments
+    #     (deprecated / prod / rnd / uat / untagged). When target_line is given the
+    #     'target' bar is dropped and the target is drawn as a dotted reference
+    #     line instead; otherwise a separate 'target' bar is shown.
+    def stacked_bar(slice_name, metric_value, target_line=None):
+        filt = f"metric = '{metric_value}'"
+        params = {
+            "viz_type": "echarts_timeseries_bar", "x_axis": "bar",
+            "x_axis_force_categorical": True, "metrics": [SUM_VALUE],
+            "groupby": ["segment"], "stack": "Stack",
+            "row_limit": 100, "orientation": "vertical", "show_legend": True,
+            "show_value": True, "truncateYAxis": False,
+            "sort_series_type": "name", "sort_series_ascending": True,
+            "y_axis_format": "SMART_NUMBER",
+        }
+        if target_line is not None:
+            # Drop the 'target' bar; show the target as a dotted horizontal line.
+            filt += " AND bar = 'actual'"
+            params["annotation_layers"] = [{
+                "name": "Target", "annotationType": "FORMULA",
+                "value": str(int(target_line)), "style": "dotted",
+                "width": 2, "opacity": "", "color": None, "sourceType": "",
+                "show": True, "showLabel": True, "showMarkers": False,
+                "hideLine": False,
+            }]
+        params["adhoc_filters"] = sql_filter(filt)
+        return (slice_name, "echarts_timeseries_bar", params, 6, 50)
+
+    specs.append(stacked_bar(FEATURE_STACK_CHART, "features", target_line=feat_target))
+
+    # 3e. Historical Feature Reuse: daily time series of features added to
+    #     feature views tagged asset='prod'. Two lines on one chart — the daily
+    #     count and the running cumulative — from the feature_reuse_daily dataset
+    #     (one row per day with both values precomputed). No time grain so the
+    #     precomputed daily/cumulative values are plotted as-is.
+    def reuse_metric(col, label, opt):
+        return {"expressionType": "SQL", "sqlExpression": f"SUM({col})",
+                "label": label, "optionName": opt, "hasCustomLabel": True}
+
     specs.append((
-        f"{CHART_PREFIX}Target vs Actual", "echarts_timeseries_bar",
-        {"viz_type": "echarts_timeseries_bar", "x_axis": "metric",
-         "x_axis_force_categorical": True, "metrics": [MAX_TARGET, MAX_ACTUAL],
-         "groupby": [], "adhoc_filters": [], "row_limit": 100,
-         "orientation": "vertical", "show_legend": True,
-         "logAxis": True, "truncateYAxis": False,
-         "y_axis_format": "SMART_NUMBER"},
+        FEATURE_REUSE_CHART, "echarts_timeseries_line",
+        {"viz_type": "echarts_timeseries_line", "x_axis": "day",
+         "time_grain_sqla": None,
+         "metrics": [reuse_metric("daily_count", "Features added (daily)", "m_daily"),
+                     reuse_metric("cumulative_count", "Features added (cumulative)",
+                                  "m_cum")],
+         "groupby": [], "adhoc_filters": [], "row_limit": 10000,
+         "show_legend": True, "markerEnabled": True,
+         "x_axis_title": "day", "y_axis_format": "SMART_NUMBER"},
         12, 50,
     ))
 
-    # 4. One progress-to-target gauge per OKR.
-    for metric in targets:
-        specs.append((
-            f"{CHART_PREFIX}{metric} — % to target", "gauge_chart",
-            {"viz_type": "gauge_chart", "metric": MAX_PCT,
-             "groupby": [], "adhoc_filters": metric_filter(metric),
-             "row_limit": 10, "min_val": 0, "max_val": 100,
-             "start_angle": 225, "end_angle": -45, "show_pointer": True,
-             "show_axis_tick": True, "show_split_line": True,
-             "value_formatter": "{value}%"},
-            4, 40,
-        ))
+    # 3f. Pipeline Lifecycle Funnel (feature groups): feature counts by asset
+    #     status, in lifecycle order untagged -> rnd -> uat -> qa -> prod (kept by
+    #     numbered stage labels + sort_by_metric off). From fg_lifecycle_funnel.
+    specs.append((
+        FG_FUNNEL_CHART, "funnel",
+        {"viz_type": "funnel", "groupby": ["stage"],
+         "metric": {"expressionType": "SQL", "sqlExpression": "SUM(cnt)",
+                    "label": "features", "optionName": "m_funnel",
+                    "hasCustomLabel": True},
+         "adhoc_filters": [], "row_limit": 10, "sort_by_metric": False,
+         "number_format": "SMART_NUMBER", "show_legend": True,
+         "tooltip_label_contents": ["key", "value", "percent"]},
+        6, 50,
+    ))
 
-    # 5. Detail table.
+    # 3g. Most Popular Features: top-20 features by the number of distinct feature
+    #     views they are used in. Horizontal bar, ordered by count desc (row_limit
+    #     20 + order_desc), whole-number value labels. From feature_popularity.
+    specs.append((
+        MOST_POPULAR_CHART, "echarts_timeseries_bar",
+        {"viz_type": "echarts_timeseries_bar", "x_axis": "feature",
+         "x_axis_force_categorical": True,
+         "metrics": [{"expressionType": "SQL",
+                      "sqlExpression": "SUM(fv_count)", "label": "feature views",
+                      "optionName": "m_fv_count", "hasCustomLabel": True}],
+         "groupby": [], "adhoc_filters": [], "orientation": "horizontal",
+         "row_limit": 20, "order_desc": True, "show_legend": False,
+         "show_value": True, "truncateYAxis": False, "y_axis_format": ",d"},
+        12, 80,
+    ))
+
+    # 4. Detail table.
     specs.append((
         f"{CHART_PREFIX}OKR Detail", "table",
         {"viz_type": "table", "query_mode": "raw",
@@ -277,18 +565,54 @@ def build_position_json(charts, title):
     return json.dumps(layout)
 
 
-def ensure_dashboard(api, title, charts):
+def stack_segment_filter_metadata(ds_id, stack_chart_ids, all_chart_ids):
+    """Native multi-select on the stacked-bar 'segment', scoped to the two
+    stacked charts (features + feature views) only.
+
+    Defaults to every segment EXCEPT 'deprecated', so deprecated counts are off by
+    default in both charts; the user can add it back from the filter. Every other
+    chart is excluded from the filter's scope so the rest of the dashboard is
+    unaffected.
+    """
+    keep = set(stack_chart_ids)
+    excluded = [cid for cid in all_chart_ids if cid not in keep]
+    # All segment values except 'deprecated' (the default selection). 'target' is
+    # the separate target bar's series and stays visible by default.
+    default_vals = [s for s in STATUS_ENUM if s != "deprecated"] + ["untagged", "target"]
+    return json.dumps({
+        "native_filter_configuration": [{
+            "id": "NATIVE_FILTER-stack_segment",
+            "name": "Status segments (deprecated off by default)",
+            "filterType": "filter_select", "type": "NATIVE_FILTER",
+            "targets": [{"datasetId": ds_id, "column": {"name": "segment"}}],
+            "controlValues": {"multiSelect": True, "enableEmptyFilter": False,
+                              "defaultToFirstItem": False, "inverseSelection": False,
+                              "searchAllOptions": False},
+            "scope": {"rootPath": ["ROOT_ID"], "excluded": excluded},
+            "defaultDataMask": {
+                "filterState": {"value": default_vals},
+                "extraFormData": {"filters": [
+                    {"col": "segment", "op": "IN", "val": default_vals}]},
+            },
+            "cascadeParentIds": [],
+        }],
+        "cross_filters_enabled": False,
+    })
+
+
+def ensure_dashboard(api, title, charts, json_metadata=None):
     position_json = build_position_json(charts, title)
     dash_id = next((d["id"] for d in list_all(api, "dashboard")
                     if d.get("dashboard_title") == title), None)
+    kwargs = {"dashboard_title": title, "published": True,
+              "position_json": position_json}
+    if json_metadata is not None:
+        kwargs["json_metadata"] = json_metadata
     if dash_id is None:
-        dash_id = api.create_dashboard(
-            dashboard_title=title, published=True,
-            position_json=position_json)["id"]
+        dash_id = api.create_dashboard(**kwargs)["id"]
         print(f"Created dashboard id={dash_id}")
     else:
-        api.update_dashboard(dash_id, dashboard_title=title, published=True,
-                             position_json=position_json)
+        api.update_dashboard(dash_id, **kwargs)
         print(f"Updated dashboard id={dash_id}")
     for ch in charts:
         api.update_chart(ch["id"], dashboards=[dash_id])
@@ -320,15 +644,77 @@ def main():
     host = api._get_superset_url() if hasattr(api, "_get_superset_url") else ""
     print(f"\nDataset '{DATASET_NAME}' ready (id={ds_id}).")
 
+    # Feature-grain dataset (one row per feature + its asset value)
+    # backing the Active / Feature OKR Progression KPI panels.
+    feat_ds_id = ensure_dataset(api, db_id, FEATURE_STATUS_DATASET, FEATURE_STATUS_SQL)
+    print(f"Dataset '{FEATURE_STATUS_DATASET}' ready (id={feat_ds_id}).")
+
+    # Stacked dataset: features (vs features target) + Feature Views (vs models
+    # target), each split by asset with a gap-to-target segment.
+    feat_target = int(targets.get("features", 0))
+    fv_target = int(targets.get("models", 0))
+    stack_ds_id = ensure_dataset(
+        api, db_id, FEATURE_STACK_DATASET,
+        build_feature_stack_sql(feat_target, fv_target))
+    print(f"Dataset '{FEATURE_STACK_DATASET}' ready (id={stack_ds_id}).")
+
+    # Daily feature-reuse time series (features added to prod-tagged feature views).
+    reuse_ds_id = ensure_dataset(
+        api, db_id, FEATURE_REUSE_DATASET, FEATURE_REUSE_SQL)
+    print(f"Dataset '{FEATURE_REUSE_DATASET}' ready (id={reuse_ds_id}).")
+
+    # Feature-group lifecycle funnel dataset (feature counts by asset status).
+    fg_funnel_ds_id = ensure_dataset(
+        api, db_id, FG_FUNNEL_DATASET, build_fg_funnel_sql())
+    print(f"Dataset '{FG_FUNNEL_DATASET}' ready (id={fg_funnel_ds_id}).")
+
+    # Feature popularity dataset (distinct feature-view usage per feature).
+    popularity_ds_id = ensure_dataset(
+        api, db_id, FEATURE_POPULARITY_DATASET, FEATURE_POPULARITY_SQL)
+    print(f"Dataset '{FEATURE_POPULARITY_DATASET}' ready (id={popularity_ds_id}).")
+
+    # Feature-view status dataset (one row per FV + its asset status).
+    fv_status_ds_id = ensure_dataset(api, db_id, FV_STATUS_DATASET, FV_STATUS_SQL)
+    print(f"Dataset '{FV_STATUS_DATASET}' ready (id={fv_status_ds_id}).")
+
+    # Delete charts retired from the dashboard so they don't linger in Superset.
+    # Covers the explicit RETIRED_CHARTS plus every per-OKR "— % to target" bar
+    # (one per metric), which have all been removed from the dashboard.
+    retired = set(RETIRED_CHARTS)
+    for c in list_all(api, "chart"):
+        name = c.get("slice_name") or ""
+        if name in retired or (
+                name.startswith(CHART_PREFIX) and name.endswith("— % to target")):
+            api.delete_chart(c["id"])
+            print(f"Deleted retired chart '{name}' (id={c['id']})")
+
     print("\nCreating charts:")
-    charts = []
+    charts, stack_chart_ids = [], []
     for slice_name, viz_type, params, width, height in chart_specs(targets):
-        cid = replace_chart(api, slice_name, viz_type, ds_id, params)
+        if slice_name == FEATURE_STACK_CHART:
+            chart_ds = stack_ds_id
+        elif slice_name == FEATURE_REUSE_CHART:         # daily reuse time series
+            chart_ds = reuse_ds_id
+        elif slice_name == FG_FUNNEL_CHART:             # FG lifecycle funnel
+            chart_ds = fg_funnel_ds_id
+        elif slice_name == MOST_POPULAR_CHART:          # top-20 popular features
+            chart_ds = popularity_ds_id
+        elif slice_name in (ACTIVE_FEATURE_CHART, PROD_FEATURE_CHART):  # feature KPIs
+            chart_ds = feat_ds_id
+        elif slice_name == PROD_MODEL_CHART:            # prod feature-view count
+            chart_ds = fv_status_ds_id
+        else:
+            chart_ds = ds_id
+        cid = replace_chart(api, slice_name, viz_type, chart_ds, params)
+        if slice_name == FEATURE_STACK_CHART:
+            stack_chart_ids.append(cid)
         charts.append({"id": cid, "name": slice_name,
                        "width": width, "height": height})
         print(f"  [{viz_type}] {slice_name} -> id={cid}")
 
-    dash_id = ensure_dashboard(api, DASHBOARD_TITLE, charts)
+    json_metadata = stack_segment_filter_metadata(
+        stack_ds_id, stack_chart_ids, [c["id"] for c in charts])
+    dash_id = ensure_dashboard(api, DASHBOARD_TITLE, charts, json_metadata)
     print(f"\nDashboard '{DASHBOARD_TITLE}' ready (id={dash_id}).")
     print(f"Open it: {host}/hopsworks-api/superset/superset/dashboard/{dash_id}/")
 
