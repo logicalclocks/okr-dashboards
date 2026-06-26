@@ -669,9 +669,12 @@ def chart_specs(targets):
                        "sqlExpression": "SUM(times_suspected)",
                        "label": "times suspected as duplicate",
                        "hasCustomLabel": True}, False]],
-         "x_axis_sort": "times suspected as duplicate", "x_axis_sort_asc": False,
+         # Horizontal bar: ECharts draws the first category at the BOTTOM, so to
+         # show the most-suspected feature at the TOP we sort the category axis
+         # ASCENDING by the metric (smallest -> bottom, largest -> top).
+         "x_axis_sort": "times suspected as duplicate", "x_axis_sort_asc": True,
          "show_legend": False, "show_value": True, "truncateYAxis": False,
-         "y_axis_format": ",d", "x_axis_title": "suspected duplicate feature",
+         "y_axis_format": ",d", "x_axis_title": "",
          "y_axis_title": "# times suspected as duplicate"},
         12, 70,
     ))
