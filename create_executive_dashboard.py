@@ -151,28 +151,59 @@ FROM hopsworks.training_dataset_feature tdf
 JOIN ({FV_STATUS_SQL}) fvs ON fvs.fv_id = tdf.feature_view_id
 WHERE tdf.feature_view_id IS NOT NULL"""
 
-# Daily time series of features added to feature views tagged asset='prod'. Each
-# feature column of a prod-tagged feature view is binned by that view's creation
-# day (feature_view.created — the moment the feature was added to a view). The
-# window function builds the running cumulative total. Columns: day, daily_count,
-# cumulative_count — backing the "Historical Feature Reuse" line chart.
+# Prod-tagged feature views: the set of feature_view ids carrying the `asset`
+# tag with status='prod'. Reused below for both the reuse count and the
+# reuse-percentage series.
+_PROD_FV_IDS = """
+        SELECT tv.feature_view_id FROM hopsworks.feature_store_tag_value tv
+        JOIN hopsworks.feature_store_tag t
+          ON t.id = tv.schema_id AND t.name = 'asset'
+        WHERE tv.feature_view_id IS NOT NULL
+          AND JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) = 'prod'""".strip()
+
+# Total number of features in the feature store (the percentage denominator),
+# matching the `features` OKR actual: cached + on-demand + embedding features.
+_TOTAL_FEATURES = ("(SELECT COUNT(*) FROM hopsworks.cached_feature)"
+                   " + (SELECT COUNT(*) FROM hopsworks.on_demand_feature)"
+                   " + (SELECT COUNT(*) FROM hopsworks.embedding_feature)")
+
+# Time series of feature reuse in feature views tagged asset='prod', binned by
+# feature_view.created. Columns:
+#   day               — the FV creation day.
+#   cumulative_count  — running total of feature usages (feature × prod FV pairs)
+#                       up to that day; backs the "Feature reuse count
+#                       (cumulative)" line.
+#   reuse_pct         — fraction (0-1) of ALL features in the store that have
+#                       been reused in a prod FV as of that day. Numerator is the
+#                       running count of DISTINCT reused features (a feature is a
+#                       (name, feature_group) pair, counted on the first day it
+#                       appears in any prod FV); denominator is the current total
+#                       feature count. Backs the secondary-axis percentage line.
 FEATURE_REUSE_DATASET = "feature_reuse_daily"
-FEATURE_REUSE_SQL = """SELECT day, daily_count,
-    SUM(daily_count) OVER (ORDER BY day) AS cumulative_count
+FEATURE_REUSE_SQL = f"""SELECT d.day,
+       SUM(d.daily_count) OVER (ORDER BY d.day) AS cumulative_count,
+       SUM(COALESCE(nf.new_features, 0)) OVER (ORDER BY d.day)
+         / NULLIF({_TOTAL_FEATURES}, 0) AS reuse_pct
 FROM (
     SELECT DATE(fv.created) AS day, COUNT(*) AS daily_count
     FROM hopsworks.training_dataset_feature tdf
     JOIN hopsworks.feature_view fv ON fv.id = tdf.feature_view_id
     WHERE tdf.feature_view_id IS NOT NULL
-      AND fv.id IN (
-        SELECT tv.feature_view_id FROM hopsworks.feature_store_tag_value tv
-        JOIN hopsworks.feature_store_tag t
-          ON t.id = tv.schema_id AND t.name = 'asset'
-        WHERE tv.feature_view_id IS NOT NULL
-          AND JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) = 'prod')
+      AND fv.id IN ({_PROD_FV_IDS})
     GROUP BY DATE(fv.created)
 ) d
-ORDER BY day"""
+LEFT JOIN (
+    SELECT first_day, COUNT(*) AS new_features FROM (
+        SELECT tdf.name, tdf.feature_group, MIN(DATE(fv.created)) AS first_day
+        FROM hopsworks.training_dataset_feature tdf
+        JOIN hopsworks.feature_view fv ON fv.id = tdf.feature_view_id
+        WHERE tdf.feature_view_id IS NOT NULL
+          AND fv.id IN ({_PROD_FV_IDS})
+        GROUP BY tdf.name, tdf.feature_group
+    ) ff
+    GROUP BY first_day
+) nf ON nf.first_day = d.day
+ORDER BY d.day"""
 
 # Feature counts grouped by their feature group's asset `status`, arranged in
 # lifecycle order untagged -> rnd -> uat -> qa -> prod for a funnel chart. Stage
@@ -213,6 +244,35 @@ FEATURE_POPULARITY_SQL = """SELECT feature, fv_count FROM (
     WHERE tdf.feature_view_id IS NOT NULL
     GROUP BY tdf.name, fg.name
 ) t ORDER BY fv_count DESC"""
+
+# Model time-to-market velocity: per model version, the number of days between
+# its source feature view being created (fv.created — data first made available)
+# and the model version being created (mv.created — model delivered). A model
+# version links to its feature view(s) via model_link.parent_feature_view_name /
+# _version; a version can reference more than one FV, so we take the EARLIEST
+# (MIN) feature-view creation as the start of the clock and aggregate to one row
+# per model version. ttm_days backs the TTM Velocity histogram. Negative spans
+# (model older than its FV — clock skew / re-registration) are dropped.
+MODEL_TTM_DATASET = "model_ttm_velocity"
+MODEL_TTM_SQL = """SELECT model_name, model_version, model_created, fv_created,
+       ttm_days
+FROM (
+    SELECT m.name AS model_name,
+           mv.version AS model_version,
+           mv.created AS model_created,
+           MIN(fv.created) AS fv_created,
+           DATEDIFF(mv.created, MIN(fv.created)) AS ttm_days
+    FROM hopsworks.model_version mv
+    JOIN hopsworks.model m ON m.id = mv.model_id
+    JOIN hopsworks.model_link ml ON ml.model_version_id = mv.id
+    JOIN hopsworks.feature_view fv
+          ON fv.name = ml.parent_feature_view_name
+         AND fv.version = ml.parent_feature_view_version
+    WHERE mv.created IS NOT NULL
+    GROUP BY mv.id, m.name, mv.version, mv.created
+) t
+WHERE fv_created IS NOT NULL AND ttm_days >= 0
+ORDER BY ttm_days"""
 
 # Dataset feeding the stacked bar charts. For each population (features, Feature
 # Views) there are two x-axis bars:
@@ -278,6 +338,45 @@ def load_targets(project):
     if not targets:
         sys.exit(f"No targets found in the '{OKRS_FG}' feature group")
     return targets
+
+
+def build_dup_features_counts_sql(project):
+    """feature_name -> times-suspected-as-duplicate, embedded as a literal SELECT.
+
+    Read the `suspected_duplicate_features` feature group via the Hopsworks
+    Feature Query Service (reliable in-process) and embed the per-feature counts.
+    The FG's offline DELTA table is NOT reliably queryable through Superset's
+    Trino connection — Trino caches the table's split/file manifest for the
+    reused path and keeps referencing parquet files that each rewrite deletes
+    (COUNT works off delta stats, but a GROUP BY scan hits the dead file). So we
+    aggregate here at build time; re-run this builder to refresh the chart after
+    the nightly detection job updates the FG. Only features actually flagged
+    appear, so features with zero suspected duplicates are naturally excluded.
+    """
+    fs = project.get_feature_store()
+    counts = {}
+    try:
+        df = fs.get_feature_group(DUP_FEATURES_FG, version=1) \
+               .select(["feature_name"]).read()
+        for name, c in df["feature_name"].value_counts().items():
+            label = "" if name is None else str(name)
+            if label:
+                counts[label] = int(c)
+    except Exception as e:
+        print(f"  ! could not read '{DUP_FEATURES_FG}' ({e}); chart left empty.")
+
+    if not counts:
+        return ("SELECT CAST(NULL AS CHAR) AS feature_name, "
+                "0 AS times_suspected WHERE 1 = 0")
+
+    def esc(s):
+        return "'" + s.replace("'", "''") + "'"
+
+    rows = [f"    SELECT {esc(name)} AS feature_name, {c} AS times_suspected"
+            for name, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    union = "\n    UNION ALL\n".join(rows)
+    return (f"SELECT feature_name, times_suspected FROM (\n{union}\n) t "
+            "WHERE times_suspected > 0 ORDER BY times_suspected DESC")
 
 
 def build_sql(targets):
@@ -395,6 +494,12 @@ FEATURE_STACK_CHART = f"{CHART_PREFIX}Feature Count Details"
 FEATURE_REUSE_CHART = f"{CHART_PREFIX}Historical Feature Reuse"
 FG_FUNNEL_CHART = f"{CHART_PREFIX}Pipeline Lifecycle Funnel for Features"
 MOST_POPULAR_CHART = f"{CHART_PREFIX}Most Popular Features"
+MODEL_TTM_CHART = f"{CHART_PREFIX}Model Time-to-Market (TTM) Velocity"
+DUP_FEATURES_CHART = f"{CHART_PREFIX}Suspected Duplicate Features"
+
+# The feature group the nightly duplicate-detection job (de)populates.
+DUP_FEATURES_FG = "suspected_duplicate_features"
+DUP_FEATURES_DATASET = "suspected_duplicate_feature_counts"
 
 
 def chart_specs(targets):
@@ -454,25 +559,34 @@ def chart_specs(targets):
 
     specs.append(stacked_bar(FEATURE_STACK_CHART, "features", target_line=feat_target))
 
-    # 3e. Historical Feature Reuse: daily time series of features added to
-    #     feature views tagged asset='prod'. Two lines on one chart — the daily
-    #     count and the running cumulative — from the feature_reuse_daily dataset
-    #     (one row per day with both values precomputed). No time grain so the
-    #     precomputed daily/cumulative values are plotted as-is.
+    # 3e. Historical Feature Reuse: time series over feature_view.created for
+    #     prod-tagged feature views, from the feature_reuse_daily dataset (one row
+    #     per day, values precomputed). A MIXED chart with two y-axes:
+    #       primary   — "Feature reuse count (cumulative)" (running usage total).
+    #       secondary — "Percentage of features that are reused" (reused / total),
+    #                   query B with yAxisIndexB=1 and a percent (.1%) format.
+    #     No time grain so the precomputed daily values are plotted as-is.
     def reuse_metric(col, label, opt):
         return {"expressionType": "SQL", "sqlExpression": f"SUM({col})",
                 "label": label, "optionName": opt, "hasCustomLabel": True}
 
     specs.append((
-        FEATURE_REUSE_CHART, "echarts_timeseries_line",
-        {"viz_type": "echarts_timeseries_line", "x_axis": "day",
-         "time_grain_sqla": None,
-         "metrics": [reuse_metric("daily_count", "Features added (daily)", "m_daily"),
-                     reuse_metric("cumulative_count", "Features added (cumulative)",
-                                  "m_cum")],
-         "groupby": [], "adhoc_filters": [], "row_limit": 10000,
-         "show_legend": True, "markerEnabled": True,
-         "x_axis_title": "day", "y_axis_format": "SMART_NUMBER"},
+        FEATURE_REUSE_CHART, "mixed_timeseries",
+        {"viz_type": "mixed_timeseries", "x_axis": "day", "time_grain_sqla": None,
+         # Query A — primary axis: cumulative reuse count.
+         "metrics": [reuse_metric("cumulative_count",
+                                  "Feature reuse count (cumulative)", "m_cum")],
+         "groupby": [], "adhoc_filters": [], "yAxisIndex": 0,
+         # Query B — secondary axis: percentage of features reused.
+         "metrics_b": [reuse_metric("reuse_pct",
+                                    "Percentage of features that are reused",
+                                    "m_pct")],
+         "groupby_b": [], "adhoc_filters_b": [], "yAxisIndexB": 1,
+         "row_limit": 10000, "show_legend": True, "markerEnabled": True,
+         "x_axis_title": "day",
+         "y_axis_format": "SMART_NUMBER", "y_axis_title": "feature reuse count",
+         "y_axis_format_secondary": ".1%",
+         "y_axis_title_secondary": "% of features reused"},
         12, 50,
     ))
 
@@ -500,8 +614,9 @@ def chart_specs(targets):
     ))
 
     # 3g. Most Popular Features: top-20 features by the number of distinct feature
-    #     views they are used in. Horizontal bar, ordered by count desc (row_limit
-    #     20 + order_desc), whole-number value labels. From feature_popularity.
+    #     views they are used in. Horizontal bar, top 20 sorted by count desc
+    #     (orderby + x_axis_sort on the metric, the viz ignores dataset order),
+    #     whole-number value labels. From feature_popularity.
     specs.append((
         MOST_POPULAR_CHART, "echarts_timeseries_bar",
         {"viz_type": "echarts_timeseries_bar", "x_axis": "feature",
@@ -510,9 +625,55 @@ def chart_specs(targets):
                       "sqlExpression": "SUM(fv_count)", "label": "feature views",
                       "optionName": "m_fv_count", "hasCustomLabel": True}],
          "groupby": [], "adhoc_filters": [], "orientation": "horizontal",
-         "row_limit": 20, "order_desc": True, "show_legend": False,
+         "row_limit": 20, "order_desc": True,
+         "orderby": [[{"expressionType": "SQL", "sqlExpression": "SUM(fv_count)",
+                       "label": "feature views", "hasCustomLabel": True}, False]],
+         "x_axis_sort": "feature views", "x_axis_sort_asc": False,
+         "show_legend": False,
          "show_value": True, "truncateYAxis": False, "y_axis_format": ",d"},
         12, 80,
+    ))
+
+    # 3h. Model Time-to-Market (TTM) Velocity: distribution of the number of days
+    #     between a model version's source feature view being created and the model
+    #     version itself being created. Histogram over ttm_days from the
+    #     model_ttm_velocity dataset (one row per model version).
+    specs.append((
+        MODEL_TTM_CHART, "histogram_v2",
+        {"viz_type": "histogram_v2", "column": "ttm_days", "groupby": [],
+         "bins": 20, "row_limit": 50000, "normalize": False, "cumulative": False,
+         "adhoc_filters": [],
+         "x_axis_title": "Time from when a feature view was created until it "
+                         "was tagged as `prod`",
+         "y_axis_title": "# model versions",
+         "x_axis_format": "SMART_NUMBER", "y_axis_format": "SMART_NUMBER"},
+        12, 55,
+    ))
+
+    # 3i. Suspected Duplicate Features: per feature name, how many times it was
+    #     flagged as a suspected duplicate by the nightly detection job. Counts
+    #     are embedded from the suspected_duplicate_features FG at build time (see
+    #     build_dup_features_counts_sql). Horizontal bar sorted by count desc;
+    #     only flagged features appear (zero-count features are excluded).
+    specs.append((
+        DUP_FEATURES_CHART, "echarts_timeseries_bar",
+        {"viz_type": "echarts_timeseries_bar", "x_axis": "feature_name",
+         "x_axis_force_categorical": True,
+         "metrics": [{"expressionType": "SQL",
+                      "sqlExpression": "SUM(times_suspected)",
+                      "label": "times suspected as duplicate",
+                      "optionName": "m_dup", "hasCustomLabel": True}],
+         "groupby": [], "adhoc_filters": [], "orientation": "horizontal",
+         "row_limit": 100, "order_desc": True,
+         "orderby": [[{"expressionType": "SQL",
+                       "sqlExpression": "SUM(times_suspected)",
+                       "label": "times suspected as duplicate",
+                       "hasCustomLabel": True}, False]],
+         "x_axis_sort": "times suspected as duplicate", "x_axis_sort_asc": False,
+         "show_legend": False, "show_value": True, "truncateYAxis": False,
+         "y_axis_format": ",d", "x_axis_title": "suspected duplicate feature",
+         "y_axis_title": "# times suspected as duplicate"},
+        12, 70,
     ))
 
     # 4. Detail table.
@@ -685,6 +846,15 @@ def main():
     fv_status_ds_id = ensure_dataset(api, db_id, FV_STATUS_DATASET, FV_STATUS_SQL)
     print(f"Dataset '{FV_STATUS_DATASET}' ready (id={fv_status_ds_id}).")
 
+    # Model time-to-market dataset (days from FV created to model created).
+    ttm_ds_id = ensure_dataset(api, db_id, MODEL_TTM_DATASET, MODEL_TTM_SQL)
+    print(f"Dataset '{MODEL_TTM_DATASET}' ready (id={ttm_ds_id}).")
+
+    # Suspected-duplicate-feature counts, embedded from the FG (read in-process).
+    dup_ds_id = ensure_dataset(api, db_id, DUP_FEATURES_DATASET,
+                               build_dup_features_counts_sql(project))
+    print(f"Dataset '{DUP_FEATURES_DATASET}' ready (id={dup_ds_id}).")
+
     # Delete charts retired from the dashboard so they don't linger in Superset.
     # Covers the explicit RETIRED_CHARTS plus every per-OKR "— % to target" bar
     # (one per metric), which have all been removed from the dashboard.
@@ -707,6 +877,10 @@ def main():
             chart_ds = fg_funnel_ds_id
         elif slice_name == MOST_POPULAR_CHART:          # top-20 popular features
             chart_ds = popularity_ds_id
+        elif slice_name == MODEL_TTM_CHART:             # model TTM velocity histogram
+            chart_ds = ttm_ds_id
+        elif slice_name == DUP_FEATURES_CHART:          # suspected duplicate features
+            chart_ds = dup_ds_id
         elif slice_name in (ACTIVE_FEATURE_CHART, PROD_FEATURE_CHART):  # feature KPIs
             chart_ds = feat_ds_id
         elif slice_name == PROD_MODEL_CHART:            # prod feature-view count
