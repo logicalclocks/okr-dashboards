@@ -45,7 +45,7 @@ Here is the json for the 'status' schematized tag:
     "additionalProperties": false
 }
 
-Build the executive dashboard by running 'create_executive_dashboard.py'. This reads the targets from the okrs feature group and pairs each one against its live actual, computed from the real hopsworks metadata tables via the mysql_hopsworks JDBC connection in Superset (no Trino). Re-run it after the OKR targets change to refresh them. Note that when you mount the MySQL tables as feature groups, it can rename columns. You will create the dashboards against the MySQL tables, so use its colun names.
+Build the executive dashboard by running 'create_executive_dashboard.py'. This reads the targets from the okrs feature group and pairs each one against its live actual, computed from the real hopsworks metadata tables via the hopsworks_analytics JDBC connection in Superset (no Trino). Re-run it after the OKR targets change to refresh them. Note that when you mount the MySQL tables as feature groups, it can rename columns. You will create the dashboards against the MySQL tables, so use its colun names.
 
 
 Then, you want to

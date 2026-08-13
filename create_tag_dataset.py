@@ -2,7 +2,7 @@
 Build the Superset tag dashboards over the Hopsworks tag metadata.
 
 The Hopsworks metadata DB has two tag tables (reached through the
-`mysql_hopsworks` Superset JDBC connection, schema `hopsworks`; NO Trino):
+`hopsworks_analytics` Superset JDBC connection, schema `hopsworks`; NO Trino):
 
   feature_store_tag(id, name, tag_schema)
       tag_schema is a JSON-Schema-ish string:
@@ -68,12 +68,26 @@ DISTINCT_ASSETS = {
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
+# Superset names the analytics connection "<connector>__<superset user>", where <connector> matches
+# HopsworksAnalyticsController.RO_CONNECTOR_NAME in hopsworks-ee.
+ANALYTICS_CONNECTION = "hopsworks_analytics"
+
+
 def find_mysql_db_id(api):
-    """The mysql_hopsworks connection: the only mysql-backend DB in Superset."""
-    for db in api.list_databases()["result"]:
-        if (db.get("backend") or "").lower() == "mysql":
+    """The analytics connection, which the backend names '<connector>__<superset user>'.
+
+    Selecting on the mysql backend alone is not enough: a project with the online feature store also has a
+    MySQL connection, so the first match can silently be the wrong database and every chart then reads it.
+    """
+    mysql_dbs = [db for db in api.list_databases()["result"]
+                 if (db.get("backend") or "").lower() == "mysql"]
+    for db in mysql_dbs:
+        if (db.get("database_name") or "").startswith(ANALYTICS_CONNECTION):
             return db["id"], db.get("database_name")
-    raise RuntimeError("No mysql backend (mysql_hopsworks) connection in Superset")
+    raise RuntimeError(
+        f"No Superset connection named {ANALYTICS_CONNECTION}* found. "
+        f"MySQL connections present: {[db.get('database_name') for db in mysql_dbs]}"
+    )
 
 
 def run_sql(api, db_id, sql):
@@ -517,7 +531,7 @@ def main():
     api = project.get_superset_api()
 
     db_id, db_name = find_mysql_db_id(api)
-    print(f"mysql_hopsworks connection: id={db_id} ({db_name})\n")
+    print(f"hopsworks_analytics connection: id={db_id} ({db_name})\n")
 
     print("Expanding tag schemas:")
     tags = load_tags(api, db_id)
