@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Create external feature groups for a requested set of tables in the
-`hopsworks` database, read through the `mysql_hopsworks` data source.
+`hopsworks` database, read through the `hopsworks_analytics` data source.
 
 One program that does it all:
 
@@ -44,7 +44,9 @@ from hsfs.feature import Feature
 warnings.filterwarnings("ignore")
 
 SOURCE_DB = "hopsworks"
-CONNECTOR = "mysql_hopsworks"
+# Must match HopsworksAnalyticsController.RO_CONNECTOR_NAME in hopsworks-ee: the backend creates the read-only
+# data source under this name, so anything else fails with a not-found before a single table is mounted.
+CONNECTOR = "hopsworks_analytics"
 VERSION = 1
 
 # Retry policy for transient LLM inference 500s (errorCode 520013).

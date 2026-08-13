@@ -1,6 +1,6 @@
 """
 Build the Superset "Analyst/Data Scientist Dashboard (Tag Filter)" over the
-Hopsworks metadata DB (reached through the `mysql_hopsworks` JDBC connection,
+Hopsworks metadata DB (reached through the `hopsworks_analytics` JDBC connection,
 schema `hopsworks`; NO Trino).
 
 This is a COPY of create-analyst-dashboard.py with ONE behavioural change to the
@@ -299,7 +299,7 @@ def main():
     api = project.get_superset_api()
 
     db_id, db_name = find_mysql_db_id(api)
-    print(f"mysql_hopsworks connection: id={db_id} ({db_name})\n")
+    print(f"hopsworks_analytics connection: id={db_id} ({db_name})\n")
 
     tags = load_tags(api, db_id)
     if not tags:
