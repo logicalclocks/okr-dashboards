@@ -53,9 +53,14 @@ VERSION = 1
 INFER_RETRIES = 4
 INFER_BACKOFF = 3  # seconds; multiplied by attempt number (3s, 6s, 9s, ...)
 
-# The exact list the user provided (table names concatenated, no separators).
+# The tables to mount (names concatenated, no separators).
+#
+# account_audit and userlogins are deliberately absent: they hold IPs, user agents and login outcomes, and the
+# read-only database user is not granted them. Requesting them anyway did no harm (the grant refused, and the
+# script skips a table it cannot read) but it left this list asking for more than policy allows, so a later
+# widening of the grants would have mounted them silently and fed sample rows to the configured model provider.
 REQUESTED_BLOB = (
-    "account_auditactivityalert_receivercached_featurecached_feature_extra_constraints"
+    "activityalert_receivercached_featurecached_feature_extra_constraints"
     "cached_feature_groupdata_sourcedatasetdataset_requestdataset_shared_withembedding"
     "embedding_featureenvironmentenvironment_historyenvironment_python_librariesexecutions"
     "expectationexpectation_suitefeature_descriptive_statisticsfeature_groupfeature_group_alert"
@@ -71,7 +76,7 @@ REQUESTED_BLOB = (
     "model_linkmodel_versionon_demand_featureon_demand_feature_groupon_demand_optionproject"
     "project_teamservingserving_depl_componentserving_deploymentserving_keyserving_model_artifact"
     "serving_remote_accessshared_featureshared_feature_groupshared_feature_storestream_feature_group"
-    "training_datasettransformation_functiontriggered_alerttrino_queriesuserloginsvalidation_result"
+    "training_datasettransformation_functiontriggered_alerttrino_queriesvalidation_result"
 )
 
 
