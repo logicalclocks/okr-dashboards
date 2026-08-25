@@ -41,6 +41,7 @@ import hopsworks
 from superset import (
     ChartSpec,
     Superset,
+    categorical_bar,
     simple_filter,
     sql_metric,
     sql_str,
@@ -139,32 +140,28 @@ def chart_specs() -> list[ChartSpec]:
         # has actually reached production.
         ChartSpec(
             name="Lifecycle · Assets in each stage now",
-            viz_type="dist_bar",
+            viz_type="echarts_timeseries_bar",
             width=6,
-            params={
-                "viz_type": "dist_bar",
-                "metrics": [assets],
-                "groupby": ["stage"],
-                "columns": ["asset_kind"],
-                "adhoc_filters": [current],
-                "row_limit": 100,
-            },
+            params=categorical_bar(
+                x_axis="stage",
+                series="asset_kind",
+                metrics=[assets],
+                adhoc_filters=[current],
+            ),
         ),
         # How long a stage takes, per kind. Completed intervals only: mixing in the ones still
         # running would drag every average toward whatever is in flight right now.
         ChartSpec(
             name="Lifecycle · Average days in each stage",
-            viz_type="dist_bar",
+            viz_type="echarts_timeseries_bar",
             width=6,
-            params={
-                "viz_type": "dist_bar",
-                "metrics": [days],
-                "groupby": ["stage"],
-                "columns": ["asset_kind"],
-                "adhoc_filters": [completed],
-                "row_limit": 100,
-                "y_axis_format": ",.1f",
-            },
+            params=categorical_bar(
+                x_axis="stage",
+                series="asset_kind",
+                metrics=[days],
+                adhoc_filters=[completed],
+                y_axis_format=",.1f",
+            ),
         ),
         # Is it getting faster or slower, by when the stage was entered.
         ChartSpec(

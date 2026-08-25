@@ -343,6 +343,43 @@ def count_metric(column: str, label: str = "count") -> dict[str, Any]:
     }
 
 
+def categorical_bar(
+    *,
+    x_axis: str,
+    series: str | None,
+    metrics: list[dict[str, Any]],
+    adhoc_filters: list[dict[str, Any]] | None = None,
+    row_limit: int = 100,
+    y_axis_format: str | None = None,
+) -> dict[str, Any]:
+    """Params for a bar chart whose x axis is a category, not a time column.
+
+    Uses `echarts_timeseries_bar`. The obvious choice, `dist_bar`, is the legacy Bar Chart, and
+    the legacy viz plugins were removed in Superset 4. Nothing rejects it on the way in: the
+    chart saves happily, the dashboard builds, and the panel then fails at render time with
+    `Item with key "dist_bar" is not registered`. So it looks like a working build until someone
+    opens it.
+
+    The echarts chart takes the category on `x_axis` and the series breakdown on `groupby`, which
+    is the opposite way round from the legacy one, where `groupby` was the axis and `columns` the
+    breakdown. `time_grain_sqla` is deliberately unset: the axis is a string.
+    """
+    params: dict[str, Any] = {
+        "viz_type": "echarts_timeseries_bar",
+        "x_axis": x_axis,
+        "groupby": [series] if series else [],
+        "metrics": metrics,
+        "adhoc_filters": adhoc_filters or [],
+        "row_limit": row_limit,
+        "orientation": "vertical",
+        "x_axis_sort_asc": True,
+        "show_legend": True,
+    }
+    if y_axis_format:
+        params["y_axis_format"] = y_axis_format
+    return params
+
+
 def sql_metric(expression: str, label: str) -> dict[str, Any]:
     return {"expressionType": "SQL", "sqlExpression": expression, "label": label}
 

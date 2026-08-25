@@ -28,7 +28,15 @@ import json
 
 import hopsworks
 
-from superset import SCHEMA, ChartSpec, Superset, count_metric, simple_filter, sql_metric
+from superset import (
+    SCHEMA,
+    ChartSpec,
+    Superset,
+    categorical_bar,
+    count_metric,
+    simple_filter,
+    sql_metric,
+)
 
 INTERVALS_DATASET = "tag_history_intervals"
 DASHBOARD_TITLE = "Tag Lifecycle"
@@ -133,18 +141,16 @@ def chart_specs(dataset_id):
         # days so far", and drag every average toward whatever is in flight right now.
         {
             "name": "Average days in each state",
-            "viz_type": "dist_bar",
+            "viz_type": "echarts_timeseries_bar",
             "width": 6,
             "height": 50,
-            "params": {
-                "viz_type": "dist_bar",
-                "metrics": [_adhoc_avg_days()],
-                "groupby": ["tag_value"],
-                "columns": ["tag_name"],
-                "adhoc_filters": [completed],
-                "row_limit": 100,
-                "y_axis_format": ",.1f",
-            },
+            "params": categorical_bar(
+                x_axis="tag_value",
+                series="tag_name",
+                metrics=[_adhoc_avg_days()],
+                adhoc_filters=[completed],
+                y_axis_format=",.1f",
+            ),
         },
         # Is it getting slower? Same measure over time, by when the state was entered.
         {
@@ -167,17 +173,15 @@ def chart_specs(dataset_id):
         # lifecycle dashboard is unreadable without the denominator.
         {
             "name": "Artifacts currently in each state",
-            "viz_type": "dist_bar",
+            "viz_type": "echarts_timeseries_bar",
             "width": 6,
             "height": 50,
-            "params": {
-                "viz_type": "dist_bar",
-                "metrics": [_adhoc_count("artifacts")],
-                "groupby": ["tag_value"],
-                "columns": ["artifact_type"],
-                "adhoc_filters": [current],
-                "row_limit": 100,
-            },
+            "params": categorical_bar(
+                x_axis="tag_value",
+                series="artifact_type",
+                metrics=[_adhoc_count("artifacts")],
+                adhoc_filters=[current],
+            ),
         },
         # What is stuck. Open intervals, longest first: the actionable end of the dashboard.
         {
