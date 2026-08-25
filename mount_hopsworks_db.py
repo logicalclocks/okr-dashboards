@@ -327,6 +327,19 @@ def create_one(fs, table_ds, tname: str, pi_state: dict) -> tuple[str, int]:
         return "information_schema", len(fg.features or [])
 
 
+# The backend's code for "that feature group is already there". Matched on the code rather than
+# the message, which is prose and has changed before.
+FG_ALREADY_EXISTS = 270089
+
+
+def already_exists(exc: Exception) -> bool:
+    """Whether a create failed only because the feature group was already there."""
+    code = getattr(exc, "error_code", None)
+    if code is not None:
+        return int(code) == FG_ALREADY_EXISTS
+    return str(FG_ALREADY_EXISTS) in str(exc)
+
+
 def has_fg(fs, tname: str):
     try:
         fg = fs.get_feature_group(tname, version=VERSION)
@@ -404,8 +417,18 @@ def main() -> None:
             print(f"{prefix}: created ({nfeat} features, via {method})")
             created.append(tname)
         except Exception as exc:
-            failed.append((tname, str(exc)))
-            print(f"{prefix}: FAILED -> {str(exc)[:200]}")
+            if already_exists(exc):
+                # The check above and this create are two calls, so anything creating the same
+                # feature group in between wins and this one is told it already exists. That
+                # happens for real: the setup flow is re-runnable and the wizard can be driving
+                # a second session against the same project. It is the outcome we wanted anyway,
+                # so count it as a skip. Reporting it as a failure made a healthy run look like
+                # it had lost half the tables.
+                print(f"{prefix}: already exists (created concurrently) -> skip")
+                skipped.append(tname)
+            else:
+                failed.append((tname, str(exc)))
+                print(f"{prefix}: FAILED -> {str(exc)[:200]}")
 
     print("\n==================== SUMMARY ====================")
     print(f"created: {len(created)}  skipped: {len(skipped)}  failed: {len(failed)}")
