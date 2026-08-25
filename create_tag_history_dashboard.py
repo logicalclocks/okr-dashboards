@@ -49,43 +49,49 @@ DASHBOARD_TITLE = "Tag Lifecycle"
 # Only OPENED rows become intervals. A CLOSED row is the END of the interval before it, never the
 # start of one, so selecting it would invent an interval that never existed.
 #
+# But the filter has to come AFTER the window, in an outer query, and that is the whole reason this
+# is written as a subquery. SQL evaluates WHERE before window functions, so filtering to OPENED in
+# the same SELECT as the LEAD() would hide every CLOSED row from the window. A value change would
+# still look right, because the next OPENED shares the CLOSED's timestamp. Everything that ends
+# WITHOUT a successor would not: a detach, an artifact delete or a schema delete would leave the
+# last OPENED with no following row, so removed_at would be NULL, is_current would be 1, and the
+# dwell time would be measured against NOW() and grow forever. Every close-out the backend writes
+# would be invisible here, and deleted artifacts would be counted as still in their last state.
+#
 # event_time is NULL for an attachment that predates the created_on column, where the start is
 # genuinely unknown. Those rows are kept (the artifact IS in that state) but dwell_seconds is NULL
 # rather than a number computed from a fabricated start.
 INTERVALS_SQL = f"""
 SELECT
-    h.artifact_type,
-    h.artifact_id,
-    h.project_id,
-    h.project_name,
-    h.tag_name,
-    h.tag_key,
-    h.tag_value,
-    h.event_time AS added_on,
-    LEAD(h.event_time) OVER (
-        PARTITION BY h.artifact_type, h.artifact_id, h.tag_name, h.tag_key
-        ORDER BY h.event_time, h.id
-    ) AS removed_at,
-    TIMESTAMPDIFF(
-        SECOND,
-        h.event_time,
-        COALESCE(
-            LEAD(h.event_time) OVER (
-                PARTITION BY h.artifact_type, h.artifact_id, h.tag_name, h.tag_key
-                ORDER BY h.event_time, h.id
-            ),
-            NOW()
-        )
-    ) AS dwell_seconds,
-    CASE
-        WHEN LEAD(h.event_time) OVER (
-                 PARTITION BY h.artifact_type, h.artifact_id, h.tag_name, h.tag_key
-                 ORDER BY h.event_time, h.id
-             ) IS NULL THEN 1
-        ELSE 0
-    END AS is_current
-FROM {SCHEMA}.tag_history h
-WHERE h.event_type = 'OPENED'
+    e.artifact_type,
+    e.artifact_id,
+    e.project_id,
+    e.project_name,
+    e.tag_name,
+    e.tag_key,
+    e.tag_value,
+    e.added_on,
+    e.removed_at,
+    TIMESTAMPDIFF(SECOND, e.added_on, COALESCE(e.removed_at, NOW())) AS dwell_seconds,
+    CASE WHEN e.removed_at IS NULL THEN 1 ELSE 0 END AS is_current
+FROM (
+    SELECT
+        h.artifact_type,
+        h.artifact_id,
+        h.project_id,
+        h.project_name,
+        h.tag_name,
+        h.tag_key,
+        h.tag_value,
+        h.event_type,
+        h.event_time AS added_on,
+        LEAD(h.event_time) OVER (
+            PARTITION BY h.artifact_type, h.artifact_id, h.tag_name, h.tag_key
+            ORDER BY h.event_time, h.id
+        ) AS removed_at
+    FROM {SCHEMA}.tag_history h
+) e
+WHERE e.event_type = 'OPENED'
 """.strip()
 
 
