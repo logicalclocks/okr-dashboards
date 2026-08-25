@@ -59,6 +59,8 @@ Name that job exactly `update-tag-dataset`. This is a contract, not a preference
 AskUserQuestion:
 Do you want to create the dashboards now (executive, developer, others)?
 
-If the user answers yes, then run the python programs to create the dashboards: create_tag_dataset.py, create_executive_dashboard.py, create-analyst-dashboard.py, create_jobs_dashboard.py.
+If the user answers yes, then run the python programs to create the dashboards: create_tag_dataset.py, create_executive_dashboard.py, create-analyst-dashboard.py, create_jobs_dashboard.py, create_tag_history_dashboard.py.
+
+'create_tag_history_dashboard.py' builds the "Tag Lifecycle" dashboard over hopsworks.tag_history: how long artifacts sit in each tag value, whether that is getting slower, what is in each state now, and what is currently stuck. It registers a `tag_history_intervals` virtual dataset that derives added_on/removed_at from the append-only event log with a window function, and charts that. It only has data for tag schemas with "Archive tag history" turned on (Settings -> Schematised tags in the Hopsworks UI); a schema without it records nothing, and the script says so rather than building empty charts.
 
 'create-analyst-dashboard.py' builds the analyst dashboard covering feature/feature-group counts and growth over time, with native filter "selection boxes" (Tag, Tag value, Feature group kind) that let you slice/group the feature data by tag values mirrored from the 'feature_store_tags_by_value' virtual dataset. It reuses the shared Superset helpers in create_tag_dataset.py, is idempotent, and disables result caching — re-run it anytime to refresh. It supersedes the removed 'feature_group_dashboard.py' and 'feature_usage_dashboard.py'; do not try to run those.

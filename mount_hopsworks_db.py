@@ -77,6 +77,10 @@ REQUESTED_BLOB = (
     "project_teamservingserving_depl_componentserving_deploymentserving_keyserving_model_artifact"
     "serving_remote_accessshared_featureshared_feature_groupshared_feature_storestream_feature_group"
     "training_datasettransformation_functiontriggered_alerttrino_queriesvalidation_result"
+    # The tag surface. tag_history is the attachment history the lifecycle dashboards read; the
+    # other three are tag VALUE tables that predate this list's last revision and were never
+    # granted, so model, deployment and job tags were invisible to every dashboard.
+    "tag_historymodel_registry_tag_valuemodel_registry_mandatory_tagjob_tag_value"
 )
 
 
