@@ -59,8 +59,46 @@ Name that job exactly `update-tag-dataset`. This is a contract, not a preference
 AskUserQuestion:
 Do you want to create the dashboards now (executive, developer, others)?
 
-If the user answers yes, then run the python programs to create the dashboards: create_tag_dataset.py, create_executive_dashboard.py, create-analyst-dashboard.py, create_jobs_dashboard.py, create_tag_history_dashboard.py.
+If the user answers yes, then run the python programs to create the dashboards: create_tag_dataset.py, create_executive_dashboard.py, create-analyst-dashboard.py, create_jobs_dashboard.py, create_tag_history_dashboard.py, create_lifecycle_dashboard.py.
 
 'create_tag_history_dashboard.py' builds the "Tag Lifecycle" dashboard over hopsworks.tag_history: how long artifacts sit in each tag value, whether that is getting slower, what is in each state now, and what is currently stuck. It registers a `tag_history_intervals` virtual dataset that derives added_on/removed_at from the append-only event log with a window function, and charts that. It only has data for tag schemas with "Archive tag history" turned on (Settings -> Schematised tags in the Hopsworks UI); a schema without it records nothing, and the script says so rather than building empty charts.
 
 'create-analyst-dashboard.py' builds the analyst dashboard covering feature/feature-group counts and growth over time, with native filter "selection boxes" (Tag, Tag value, Feature group kind) that let you slice/group the feature data by tag values mirrored from the 'feature_store_tags_by_value' virtual dataset. It reuses the shared Superset helpers in create_tag_dataset.py, is idempotent, and disables result caching — re-run it anytime to refresh. It supersedes the removed 'feature_group_dashboard.py' and 'feature_usage_dashboard.py'; do not try to run those.
+
+
+'superset.py' is the library the dashboard builders share: connecting to the analytics database,
+registering a virtual dataset, (re)creating charts and laying them out. It has no dashboard of its
+own and is not run directly. Import from it rather than from another builder script, which is what
+the builders used to do and which dragged that script's constants and argument parsing along.
+
+'create_lifecycle_dashboard.py' builds the "Asset Lifecycle" dashboard: how assets move through
+dev -> qa -> prod, per asset kind. It reads hopsworks.tag_history through a
+`asset_lifecycle_intervals` virtual dataset and charts how many assets sit in each stage now, how
+long each stage takes, whether that is trending, and what is stuck. Pass `--tag` and `--field` if
+the lifecycle tag is not `asset_lifecycle`/`status`.
+
+It covers feature groups, feature views, training datasets, models, jobs, model deployments and
+agent deployments. The last two are the same kind of row in `serving` and are told apart by whether
+a model artifact is attached. **Hopsworks apps are not covered**: they are not a taggable artifact
+(no tags sub-resource on the apps API, no tag methods on the App entity, no APP artifact type in
+tag_history), so a lifecycle tag cannot be attached to one. Covering apps needs a backend change,
+not a dashboard one.
+
+Two things about the interval SQL, both of which produced wrong numbers before they were fixed and
+neither of which is obvious from reading the result:
+
+  - The `LEAD()` window must run over ALL events, with the OPENED filter applied in an OUTER query.
+    SQL evaluates WHERE before window functions, so filtering inside hides every CLOSED row from
+    the window, and anything ending without a successor (a detach, an artifact delete) reads as
+    still current with a dwell growing against NOW() forever.
+  - The window must order by `(event_time, CLOSED-before-OPENED, id)`. Both halves of a value change
+    share a timestamp by design, and the row ids are NOT assigned in the logical order, so ordering
+    by `(event_time, id)` returns an interval's own start as its end and every intermediate stage
+    reports a zero-second dwell.
+
+'seed_asset_lifecycle.py' attaches that lifecycle tag to every taggable asset in a project and
+promotes a share of them through the stages, so the dashboard has real transitions to read. It is a
+demo/test aid, not part of the setup flow: run it against a populated project
+(`python seed_asset_lifecycle.py --project <name>`) when you need data. It turns archiving on
+BEFORE attaching anything, because turning it on afterwards backfills each attachment at its attach
+time and records no transitions.

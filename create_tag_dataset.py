@@ -73,198 +73,107 @@ DISTINCT_ASSETS = {
 ANALYTICS_CONNECTION = "hopsworks_analytics"
 
 
-def find_mysql_db_id(api):
-    """The analytics connection, which the backend names '<connector>__<superset user>'.
+# The Superset primitives moved to `superset.py` so a builder can import them without
+# importing this script. Re-exported here because three builders still import them from
+# this module, and because module-level names are the only contract those imports have.
+from superset import (  # noqa: E402  (kept next to what it replaces)
+    ChartSpec,
+    Chart,
+    Superset,
+    layout_json,
+    sanitize,
+    sql_str,
+    simple_filter,
+    count_metric,
+    sql_metric,
+)
 
-    Selecting on the mysql backend alone is not enough: a project with the online feature store also has a
-    MySQL connection, so the first match can silently be the wrong database and every chart then reads it.
+
+def find_mysql_db_id(api):
+    """Back-compat wrapper: returns (id, name) as callers expect."""
+    superset = Superset.connect(api)
+    return superset.database_id, superset.database_name
+
+
+def _superset(api, db_id=None):
+    """Rebuild a client around an already-resolved database id.
+
+    `db_id` is None for the chart and dashboard calls, which are database-independent:
+    Superset resolves those by id, not by connection.
     """
-    mysql_dbs = [db for db in api.list_databases()["result"]
-                 if (db.get("backend") or "").lower() == "mysql"]
-    for db in mysql_dbs:
-        if (db.get("database_name") or "").startswith(ANALYTICS_CONNECTION):
-            return db["id"], db.get("database_name")
-    raise RuntimeError(
-        f"No Superset connection named {ANALYTICS_CONNECTION}* found. "
-        f"MySQL connections present: {[db.get('database_name') for db in mysql_dbs]}"
-    )
+    return Superset(api, db_id, "")
 
 
 def run_sql(api, db_id, sql):
-    body = {
-        "database_id": db_id, "sql": sql, "schema": SCHEMA,
-        "runAsync": False, "select_as_cta": False, "json": True,
-    }
-    r = api._request("POST", "/api/v1/sqllab/execute/", json_data=body)
-    cols = [c["name"] for c in r.get("columns", [])]
-    return [dict(zip(cols, [row.get(c) for c in cols])) for row in r.get("data", [])]
-
-
-def sanitize(name):
-    s = re.sub(r"[^0-9a-zA-Z]+", "_", name.strip().lower()).strip("_")
-    return s or "field"
-
-
-def sql_str(s):
-    """A safe single-quoted SQL string literal."""
-    return "'" + s.replace("'", "''") + "'"
+    return _superset(api, db_id).sql(sql)
 
 
 def load_tags(api, db_id):
-    """Read tag schemas -> [{id, name, fields:[(field_name, field_type), ...]}]."""
-    rows = run_sql(api, db_id,
-                   "SELECT id, name, tag_schema FROM feature_store_tag ORDER BY id")
-    tags = []
-    for r in rows:
-        try:
-            schema = json.loads(r["tag_schema"])
-        except (TypeError, ValueError) as e:
-            print(f"  ! skipping tag {r.get('name')!r}: bad schema JSON ({e})")
-            continue
-        props = schema.get("properties") or {}
-        fields = [(fname, (fspec or {}).get("type", "string"))
-                  for fname, fspec in props.items()]
-        tags.append({"id": int(r["id"]), "name": r["name"], "fields": fields})
-        flist = ", ".join(f"{n}:{t}" for n, t in fields)
-        print(f"  tag #{r['id']} {r['name']!r} -> [{flist}]")
-    return tags
+    """[{id, name, fields:[(name, type)]}] — dicts, as the builders here expect."""
+    from superset import load_tags as _load_tags
+    return [
+        {"id": t.id, "name": t.name, "fields": t.fields}
+        for t in _load_tags(_superset(api, db_id))
+    ]
 
 
 def ensure_dataset(api, db_id, name, sql):
-    # list-then-create/update (create fails if (schema, table_name) exists)
-    page, existing = 0, None
-    while True:
-        j = api._request("GET", f"/api/v1/dataset/?q=(page:{page},page_size:100)")
-        batch = j.get("result", [])
-        for ds in batch:
-            if ds.get("table_name") == name and ds.get("schema") == SCHEMA:
-                existing = ds
-                break
-        if existing or len(batch) < 100:
-            break
-        page += 1
-
-    if existing:
-        ds_id = existing["id"]
-        api.update_dataset(ds_id, sql=sql)
-        print(f"Updated existing dataset id={ds_id}")
-    else:
-        ds_id = api.create_dataset(
-            database_id=db_id, table_name=name, schema=SCHEMA, sql=sql)["id"]
-        print(f"Created dataset id={ds_id}")
-
-    # Superset does NOT re-introspect a virtual dataset's columns when its SQL
-    # changes — the column list is persisted and goes stale. Force a re-sync so
-    # newly added tag columns get registered, and disable result caching so
-    # charts always reflect freshly added tag values.
-    api._request("PUT", f"/api/v1/dataset/{ds_id}/refresh")
-    api.update_dataset(ds_id, cache_timeout=0)
-    cols = api.get_dataset(ds_id).get("result", {}).get("columns", [])
-    print(f"  synced {len(cols)} columns; cache disabled (cache_timeout=0)")
-    return ds_id
+    return _superset(api, db_id).ensure_dataset(name, sql)
 
 
 def list_all(api, resource):
-    items, page = [], 0
-    while True:
-        j = api._request("GET", f"/api/v1/{resource}/?q=(page:{page},page_size:100)")
-        batch = j.get("result", [])
-        items.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return items
+    return list(_superset(api)._each(resource))
 
 
 def replace_chart(api, slice_name, viz_type, dataset_id, params):
-    for c in list_all(api, "chart"):
-        if c.get("slice_name") == slice_name:
-            api.delete_chart(c["id"])
-    return api.create_chart(
-        slice_name=slice_name, viz_type=viz_type, datasource_id=dataset_id,
-        params=json.dumps(params))["id"]
+    spec = ChartSpec(name=slice_name, viz_type=viz_type, params=params)
+    return _superset(api).replace_chart(spec, dataset_id).id
 
 
 def build_position_json(charts, title):
-    """charts: list of {id, name, width, height}. Greedily pack rows to 12 cols."""
-    layout = {
-        "DASHBOARD_VERSION_KEY": "v2",
-        "ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": ["GRID_ID"]},
-        "GRID_ID": {"type": "GRID", "id": "GRID_ID", "children": [],
-                    "parents": ["ROOT_ID"]},
-        "HEADER_ID": {"id": "HEADER_ID", "type": "HEADER", "meta": {"text": title}},
-    }
-    row_idx, col_used, row_id = 0, 0, None
-
-    def new_row():
-        nonlocal row_idx, col_used, row_id
-        row_idx += 1
-        col_used = 0
-        row_id = f"ROW-{row_idx}"
-        layout[row_id] = {"type": "ROW", "id": row_id, "children": [],
-                          "parents": ["ROOT_ID", "GRID_ID"],
-                          "meta": {"background": "BACKGROUND_TRANSPARENT"}}
-        layout["GRID_ID"]["children"].append(row_id)
-
-    new_row()
-    for ch in charts:
-        w = min(ch["width"], 12)
-        if col_used + w > 12:
-            new_row()
-        nid = f"CHART-{ch['id']}"
-        layout[nid] = {"type": "CHART", "id": nid, "children": [],
-                       "parents": ["ROOT_ID", "GRID_ID", row_id],
-                       "meta": {"width": w, "height": ch["height"],
-                                "chartId": ch["id"], "sliceName": ch["name"]}}
-        layout[row_id]["children"].append(nid)
-        col_used += w
-    return json.dumps(layout)
+    return layout_json(
+        [
+            Chart(
+                id=c["id"],
+                spec=ChartSpec(
+                    name=c["name"], viz_type="", params={},
+                    width=c["width"], height=c["height"],
+                ),
+            )
+            for c in charts
+        ],
+        title,
+    )
 
 
 def ensure_dashboard(api, title, charts):
-    position_json = build_position_json(charts, title)
-    dash_id = next((d["id"] for d in list_all(api, "dashboard")
-                    if d.get("dashboard_title") == title), None)
-    if dash_id is None:
-        dash_id = api.create_dashboard(
-            dashboard_title=title, published=True,
-            position_json=position_json)["id"]
-        print(f"Created dashboard id={dash_id}")
-    else:
-        api.update_dashboard(dash_id, dashboard_title=title, published=True,
-                             position_json=position_json)
-        print(f"Updated dashboard id={dash_id}")
-    for ch in charts:                          # persist chart -> dashboard link
-        api.update_chart(ch["id"], dashboards=[dash_id])
-    return dash_id
+    return _superset(api).ensure_dashboard(
+        title,
+        [
+            Chart(
+                id=c["id"],
+                spec=ChartSpec(
+                    name=c["name"], viz_type="", params={},
+                    width=c["width"], height=c["height"],
+                ),
+            )
+            for c in charts
+        ],
+    )
 
 
 def build_dashboard(api, db_id, host, dataset_name, title, sql, specs):
     """Preview the SQL, register the dataset, (re)create charts, build dashboard."""
-    print(f"\nGenerated SQL for '{dataset_name}':\n")
-    print(sql)
-
-    # sanity-check the SQL actually runs before registering it as a dataset
-    preview = run_sql(api, db_id, f"SELECT * FROM (\n{sql}\n) _preview LIMIT 5")
-    print(f"\nPreview returned {len(preview)} row(s). Sample:")
-    for row in preview:
-        print("  ", json.dumps(row, default=str))
-
-    ds_id = ensure_dataset(api, db_id, dataset_name, sql)
-    print(f"Dataset '{dataset_name}' ready (id={ds_id}).")
-
-    print("Creating charts:")
-    charts = []
-    for slice_name, viz_type, params, width, height in specs:
-        cid = replace_chart(api, slice_name, viz_type, ds_id, params)
-        charts.append({"id": cid, "name": slice_name,
-                       "width": width, "height": height})
-        print(f"  [{viz_type}] {slice_name} -> id={cid}")
-
-    dash_id = ensure_dashboard(api, title, charts)
-    print(f"Dashboard '{title}' ready (id={dash_id}).")
-    print(f"Open it: {host}/hopsworks-api/superset/superset/dashboard/{dash_id}/")
-    return ds_id, dash_id
+    return _superset(api, db_id).build(
+        dataset=dataset_name,
+        title=title,
+        statement=sql,
+        specs=[
+            ChartSpec(name=n, viz_type=v, params=p, width=w, height=h)
+            for n, v, p, w, h in specs
+        ],
+        host=host,
+    )
 
 
 # --------------------------------------------------------------------------- #

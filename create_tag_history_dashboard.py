@@ -28,14 +28,7 @@ import json
 
 import hopsworks
 
-from create_tag_dataset import (
-    SCHEMA,
-    ensure_dashboard,
-    ensure_dataset,
-    find_mysql_db_id,
-    replace_chart,
-    run_sql,
-)
+from superset import SCHEMA, ChartSpec, Superset, count_metric, simple_filter, sql_metric
 
 INTERVALS_DATASET = "tag_history_intervals"
 DASHBOARD_TITLE = "Tag Lifecycle"
@@ -87,7 +80,9 @@ FROM (
         h.event_time AS added_on,
         LEAD(h.event_time) OVER (
             PARTITION BY h.artifact_type, h.artifact_id, h.tag_name, h.tag_key
-            ORDER BY h.event_time, h.id
+            ORDER BY h.event_time,
+                     CASE WHEN h.event_type = 'CLOSED' THEN 0 ELSE 1 END,
+                     h.id
         ) AS removed_at
     FROM {SCHEMA}.tag_history h
 ) e
