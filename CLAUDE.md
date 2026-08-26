@@ -2,6 +2,12 @@ This repo is used to build superset dashboards for Hopsworks. You should pick th
 
 The first task is to mount all the tables in the mysql 'hopsworks' database as external feature groups. You do this by running 'mount_hopsworks_db.py'. AskUserQuestion if they want to mount the hopsworks database tables if they have not already been mounted.
 
+That same run also registers the 'asset_lifecycle' tag schema if it is not already there: status (deprecated | dev | qa | uat | prod) and owner. It is created with history archiving ON, which is what lets create_lifecycle_dashboard.py chart how long assets sit in each stage. Archiving cannot be added retroactively: switching it on later backfills a baseline rather than recovering the transitions that happened while it was off, so creation is the only moment that loses nothing.
+
+An existing schema is left exactly as it is, archive flag included, because re-registering would mean deleting it and that cascades away every attachment across every project. If it exists without archiving, the run says so and prints the admin call to turn it on.
+
+Registering a tag schema is admin-only, which is fine here: this wizard is admin-only too.
+
 The second task is to create a new feature group called okrs that will store the user's OKRs that will be shown in an 'executive dashboard'. If the okrs feature group has not been created and populated, then do the following:
 
 AskUserQuestion: 

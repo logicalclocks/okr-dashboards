@@ -38,7 +38,11 @@ import time
 import warnings
 
 import hopsworks
-from hopsworks_common.client.exceptions import PlatformIntelligenceException
+from hopsworks_common.client.exceptions import (
+    PlatformIntelligenceException,
+    RestAPIError,
+)
+from hopsworks_common.core.tag_schemas_api import TagSchemasApi
 from hsfs.feature import Feature
 
 warnings.filterwarnings("ignore")
@@ -48,6 +52,39 @@ SOURCE_DB = "hopsworks"
 # data source under this name, so anything else fails with a not-found before a single table is mounted.
 CONNECTOR = "hopsworks_analytics"
 VERSION = 1
+
+# The lifecycle tag the analytics dashboards read. Created here because this is the
+# first step of the setup flow that already has an admin's session: registering a tag
+# schema is admin-only, and the wizard that runs this is admin-only too.
+LIFECYCLE_TAG = "asset_lifecycle"
+
+# Registered with archiving ON. Without it the tag records only its current value, so
+# create_lifecycle_dashboard.py has nothing to chart: history starts when archiving is
+# switched on, and switching it on later backfills a baseline rather than recovering the
+# transitions that happened in between. Turning it on at creation is the only moment that
+# loses nothing.
+LIFECYCLE_ARCHIVE = True
+
+# The schema document. `name` is deliberately not a member: the registered name is
+# LIFECYCLE_TAG, passed as a query parameter, and carrying a second, different name inside
+# the body would leave two answers to what this tag is called.
+LIFECYCLE_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "description": "Status of AI assets in Hopsworks",
+    "type": "object",
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["deprecated", "dev", "qa", "uat", "prod"],
+        },
+        "owner": {
+            "type": "string",
+            "description": "Team accountable for the asset",
+        },
+    },
+    "required": ["status"],
+    "additionalProperties": False,
+}
 
 # Retry policy for transient LLM inference 500s (errorCode 520013).
 INFER_RETRIES = 4
@@ -329,6 +366,50 @@ def create_one(fs, table_ds, tname: str, pi_state: dict) -> tuple[str, int]:
 
 # The backend's code for "that feature group is already there". Matched on the code rather than
 # the message, which is prose and has changed before.
+def ensure_lifecycle_tag() -> None:
+    """Register the lifecycle tag schema, unless it is already there.
+
+    Only ever creates. An existing schema is left exactly as it is, including its archive
+    flag: re-registering would mean deleting it, and deleting a tag schema cascades away
+    every attachment of it across every project. If it exists but is not archiving, that is
+    reported rather than changed, because turning archiving on is a decision with a cost
+    (it backfills a baseline) and it is not this script's to make.
+    """
+    api = TagSchemasApi()
+    try:
+        existing = api.get(LIFECYCLE_TAG)
+    except RestAPIError:
+        existing = None
+
+    if existing is not None:
+        archived = bool(existing.get("archive"))
+        print(f"Tag schema {LIFECYCLE_TAG!r} already exists -> left untouched")
+        if not archived:
+            print(
+                f"  ! it is NOT archiving, so tag_history records nothing for it and the\n"
+                f"    Asset Lifecycle dashboard will be empty. Turn it on when you are ready:\n"
+                f"    PUT /hopsworks-api/api/tags/{LIFECYCLE_TAG}/archive?value=true"
+            )
+        return
+
+    try:
+        api.create(LIFECYCLE_TAG, LIFECYCLE_SCHEMA, archive=LIFECYCLE_ARCHIVE)
+    except PermissionError as e:
+        # Registering a schema is admin-only. The wizard is too, so this should not happen;
+        # say what went wrong rather than failing the whole mount over it.
+        print(f"  ! could not create tag schema {LIFECYCLE_TAG!r}: {e}")
+        return
+    except Exception as exc:  # noqa: BLE001 - a tag schema must not fail the mount
+        print(f"  ! could not create tag schema {LIFECYCLE_TAG!r}: {exc}")
+        return
+
+    print(
+        f"Created tag schema {LIFECYCLE_TAG!r} "
+        f"(archiving {'on' if LIFECYCLE_ARCHIVE else 'off'}), "
+        f"statuses: {', '.join(LIFECYCLE_SCHEMA['properties']['status']['enum'])}"
+    )
+
+
 FG_ALREADY_EXISTS = 270089
 
 
@@ -401,6 +482,11 @@ def main() -> None:
     if mode.isdigit():
         requested = requested[: int(mode)]
         print(f"\n[test mode] limiting to first {len(requested)} table(s)")
+
+    # After the plan and verify returns above, so the read-only modes stay read-only.
+    print()
+    ensure_lifecycle_tag()
+    print()
 
     created, skipped, failed = [], [], []
     pi_state = {"enabled": None}  # one-time platform-intelligence probe cache
