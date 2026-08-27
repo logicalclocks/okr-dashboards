@@ -71,6 +71,8 @@ If the user answers yes, then run the python programs to create the dashboards: 
 
 'create-analyst-dashboard.py' builds the analyst dashboard covering feature/feature-group counts and growth over time, with native filter "selection boxes" (Tag, Tag value, Feature group kind) that let you slice/group the feature data by tag values mirrored from the 'feature_store_tags_by_value' virtual dataset. It reuses the shared Superset helpers in create_tag_dataset.py, is idempotent, and disables result caching — re-run it anytime to refresh. It supersedes the removed 'feature_group_dashboard.py' and 'feature_usage_dashboard.py'; do not try to run those.
 
+It builds one of two dashboards, chosen by `--variant`. They differ in the weekly feature-growth chart alone: `stacked` (the default, "Analyst/Data Scientist Dashboard") explodes a series per tag value so the whole breakdown is on screen at once, and `filtered` ("Analyst · Tag-Filtered Features") draws one bar per week for the Tag value selection box to narrow, which is the only readable form once there are more than a handful of values. Each keeps its own dashboard title and chart-name prefix, so building one never disturbs the other. These were two 450-line files identical but for one `groupby` list; the copy is gone, so a fix to the analyst dashboard now only has to be made once. 'create-analyst-dashboard-tagfilter.py' no longer exists.
+
 
 No builder hardcodes a lifecycle tag name any more. `superset.resolve_lifecycle_tag` picks the
 first schema the cluster actually has from `asset_lifecycle`, `asset`, `sdlc`, `lifecycle_status`,

@@ -37,15 +37,37 @@ the feature-group-activity charts (they read the `feature_group_inventory`
 dataset). The usage / reuse / status charts are excluded from those filters
 because their datasets don't carry the tag columns.
 
-Idempotent (list-then-create/update, replace-charts-by-name under the
-"Analyst · " prefix) with result caching disabled on the virtual datasets, so
-it reflects current state on every open. Charts are namespaced under their own
-prefix so re-running never disturbs the standalone dashboards.
+TWO VARIANTS
+------------
+The only thing that differs between them is the weekly feature-growth chart,
+and which dashboard it lands on:
 
-Run:  python analyst_dashboard.py
+  --variant stacked   (default)  "Analyst/Data Scientist Dashboard"
+        "New Features per Week (by tag value)" — every tag value is exploded
+        into its own stacked series, so the whole breakdown is on screen at once.
+
+  --variant filtered             "Analyst · Tag-Filtered Features"
+        "New Features per Week" — one bar per week, no explosion. You pick the
+        tag values from the "Tag value" selection box, which is scoped to drive
+        this chart. Empty selection shows all features.
+
+Neither is better; they answer the same question at different cardinalities.
+Above a handful of tag values the stacked chart becomes unreadable and the
+filtered one is the only usable form, which is why both exist.
+
+They were separate 450-line files, identical but for one `groupby` list, a
+title and a prefix. Each variant keeps its own dashboard title and chart-name
+prefix, so building one never disturbs the other.
+
+Idempotent (list-then-create/update, replace-charts-by-name under the variant's
+prefix) with result caching disabled on the virtual datasets, so it reflects
+current state on every open.
+
+Run:  python create-analyst-dashboard.py [--variant stacked|filtered] [--tag NAME]
 """
 import argparse
 import json
+from dataclasses import dataclass
 
 import hopsworks
 
@@ -64,8 +86,36 @@ from create_tag_dataset import (
     sql_str,
 )
 
-TITLE = "Analyst/Data Scientist Dashboard"
-PREFIX = "Analyst · "                          # namespaces charts for idempotency
+
+@dataclass(frozen=True)
+class Variant:
+    """A dashboard this builder can produce.
+
+    `weekly_groupby` is the whole difference: `["tag_value"]` stacks a series per tag value,
+    `[]` draws one bar per week for the "Tag value" selection box to narrow. Everything else
+    here exists to keep the two dashboards from overwriting each other's charts.
+    """
+
+    title: str
+    prefix: str
+    weekly_chart: str
+    weekly_groupby: list[str]
+
+
+VARIANTS = {
+    "stacked": Variant(
+        title="Analyst/Data Scientist Dashboard",
+        prefix="Analyst · ",
+        weekly_chart="New Features per Week (by tag value)",
+        weekly_groupby=["tag_value"],
+    ),
+    "filtered": Variant(
+        title="Analyst · Tag-Filtered Features",
+        prefix="Analyst (Tag Filter) · ",
+        weekly_chart="New Features per Week",
+        weekly_groupby=[],
+    ),
+}
 
 # --- Datasets --------------------------------------------------------------- #
 INVENTORY_DATASET = "feature_group_inventory"
@@ -289,7 +339,8 @@ def build_json_metadata(ds_id, excluded):
             # Single-select: pick the tag dimension to group/slice by.
             native_filter("tagfield", "Tag", ds_id, "tag_field",
                           multi=False, excluded=excluded, default_first=False),
-            # Multi-select: narrow to specific tag values.
+            # Multi-select: narrow to specific tag values. Under --variant filtered this
+            # is what drives the weekly chart, which carries no breakdown of its own.
             native_filter("tagvalue", "Tag value", ds_id, "tag_value",
                           multi=True, excluded=excluded),
             # Bonus: filter by feature kind.
@@ -328,11 +379,21 @@ def ensure_dashboard(api, title, charts, json_metadata):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument(
+        "--variant",
+        default="stacked",
+        choices=sorted(VARIANTS),
+        help="how the weekly feature-growth chart breaks down, and which dashboard it "
+             "lands on: 'stacked' explodes a series per tag value, 'filtered' draws one "
+             "bar per week for the Tag value selection box to narrow",
+    )
+    parser.add_argument(
         "--tag",
         help="lifecycle tag schema for the status chart; resolved from the cluster when "
              "omitted (see superset.LIFECYCLE_TAG_ORDER)",
     )
     args = parser.parse_args()
+    variant = VARIANTS[args.variant]
+    print(f"Building {variant.title!r} (--variant {args.variant})")
 
     project = hopsworks.login()
     api = project.get_superset_api()
@@ -372,7 +433,7 @@ def main():
 
     for retired in RETIRED_CHARTS:
         for chart in list_all(api, "chart"):
-            if chart.get("slice_name") == f"{PREFIX}{retired}":
+            if chart.get("slice_name") == f"{variant.prefix}{retired}":
                 api.delete_chart(chart["id"])
                 print(f"Deleted retired chart {chart['slice_name']!r}")
 
@@ -381,7 +442,7 @@ def main():
     inventory_cids = []   # chart ids the tag/kind native filters should target
 
     def add(slice_name, viz_type, ds_id, params, width, height, inventory=False):
-        full_name = f"{PREFIX}{slice_name}"
+        full_name = f"{variant.prefix}{slice_name}"
         cid = replace_chart(api, full_name, viz_type, ds_id,
                             {**params, "viz_type": viz_type})
         charts.append({"id": cid, "name": full_name, "width": width, "height": height})
@@ -399,8 +460,11 @@ def main():
     add("Total Feature Groups", "big_number_total", ds_inv,
         {"metric": FG_METRIC, "adhoc_filters": [], "y_axis_format": "SMART_NUMBER",
          "subheader": "feature groups in the feature store"}, 6, 30, inventory=True)
-    add("New Features per Week (by tag value)", "echarts_timeseries_bar", ds_inv,
-        weekly_bar(FEATURES_METRIC, ["tag_value"]), 12, 52, inventory=True)
+    # The variant's whole reason for existing. `stacked` puts a series per tag value on
+    # screen at once; `filtered` draws one bar per week and lets the Tag value selection
+    # box narrow it, which is the only readable form once there are more than a handful.
+    add(variant.weekly_chart, "echarts_timeseries_bar", ds_inv,
+        weekly_bar(FEATURES_METRIC, variant.weekly_groupby), 12, 52, inventory=True)
     add("New Feature Groups per Week", "echarts_timeseries_bar", ds_inv,
         weekly_bar(FG_METRIC, []), 6, 50, inventory=True)
     add("New Features per Week (by kind)", "echarts_timeseries_bar", ds_inv,
@@ -452,9 +516,9 @@ def main():
     excluded = [c["id"] for c in charts if c["id"] not in inventory_cids]
     json_metadata = build_json_metadata(ds_inv, excluded)
 
-    dash_id = ensure_dashboard(api, TITLE, charts, json_metadata)
+    dash_id = ensure_dashboard(api, variant.title, charts, json_metadata)
     host = api._get_superset_url() if hasattr(api, "_get_superset_url") else ""
-    print(f"\nDashboard '{TITLE}' ready (id={dash_id}).")
+    print(f"\nDashboard '{variant.title}' ready (id={dash_id}).")
     print(f"Open it: {host}/hopsworks-api/superset/superset/dashboard/{dash_id}/")
 
 
