@@ -65,7 +65,7 @@ Name that job exactly `update-tag-dataset`. This is a contract, not a preference
 AskUserQuestion:
 Do you want to create the dashboards now (executive, developer, others)?
 
-If the user answers yes, then run the python programs to create the dashboards: create_tag_dataset.py, create_executive_dashboard.py, create-analyst-dashboard.py, create_jobs_dashboard.py, create_tag_history_dashboard.py, create_lifecycle_dashboard.py.
+If the user answers yes, then run the python programs to create the dashboards: create_tag_dataset.py, create_executive_dashboard.py, create-analyst-dashboard.py, create_jobs_dashboard.py, create_tag_history_dashboard.py, create_lifecycle_dashboard.py, create_promotion_dashboard.py.
 
 'create_tag_history_dashboard.py' builds the "Tag Lifecycle" dashboard over hopsworks.tag_history: how long artifacts sit in each tag value, whether that is getting slower, what is in each state now, and what is currently stuck. It registers a `tag_history_intervals` virtual dataset that derives added_on/removed_at from the append-only event log with a window function, and charts that. It only has data for tag schemas with "Archive tag history" turned on (Settings -> Schematised tags in the Hopsworks UI); a schema without it records nothing, and the script says so rather than building empty charts.
 
@@ -108,3 +108,26 @@ demo/test aid, not part of the setup flow: run it against a populated project
 (`python seed_asset_lifecycle.py --project <name>`) when you need data. It turns archiving on
 BEFORE attaching anything, because turning it on afterwards backfills each attachment at its attach
 time and records no transitions.
+
+
+'create_promotion_dashboard.py' builds the "Asset Promotion Time" dashboard: how long assets take
+to travel dev -> uat -> prod. It answers a different question from the Asset Lifecycle dashboard
+and derives its data differently. That one measures dwell, how long an asset sits in one stage,
+one row per interval. This one measures the journey: per asset, the time between first entering
+one stage and first entering the next, so `dev -> prod` is a single number however many stages or
+detours it passed through. Average, longest, distribution, how many complete each step, the trend
+by week, and the slowest journeys. Pass `--stages` for a different path (default dev,uat,prod).
+
+Stage entry is the FIRST entry, not the last: an asset demoted from prod and promoted again has
+entered prod twice, and taking the later one would report the round trip as its time to
+production. Only forward journeys count, since a rollback would otherwise contribute a negative
+duration and quietly drag every average down.
+
+'seed_promotion_history.py' is a demo aid for that dashboard, not part of the setup flow. Real
+promotions through seed_asset_lifecycle.py happen seconds apart, because it drives the REST API
+and the backend timestamps each write as it happens, which leaves every duration at zero and the
+charts with nothing to show. This writes backdated history rows directly so they do. It needs a
+privileged MySQL account (the analytics read-only user cannot write), and it DELETES the tag's
+existing history first so the result is one coherent set of journeys rather than backdated rows
+interleaved with real ones. The rows it writes carry a correctly computed event_id, so the unique
+key and the interval derivation treat them exactly like rows the backend wrote.
