@@ -15,9 +15,11 @@ Actuals — one COUNT per OKR, over the live `hopsworks` MySQL tables:
     features          cached_feature + on_demand_feature + embedding_feature
     models            model
     model deployments serving
-    agent deployments agent
     dashboards        dashboard
     apps              jobs WHERE type = 'PYTHON_APP'
+
+Any other OKR metric (including "agent deployments", whose table was removed
+from the schema) shows its target with an actual of 0.
 
 This program:
   1. reads the OKR targets from the `okrs` feature group,
@@ -64,14 +66,23 @@ RETIRED_CHARTS = [
 
 # Live MySQL actual for each OKR metric: a scalar SQL expression counting the
 # real Hopsworks metadata rows. Keyed by the metric name stored in the `okrs`
-# FG. `apps` has no table in the metadata DB, so its actual is the literal 0.
+# FG. A metric with no entry here falls back to the literal 0, so an OKR can
+# carry a target without a table behind it.
+#
+# "agent deployments" is one of those: it used to count hopsworks.agent, but
+# that table was dropped by hopsworks-ee migration V82 ([HWORKS-2789], remove
+# brewer) and no longer exists in the schema, so the query failed with
+# "Table 'hopsworks.agent' doesn't exist". Adding the table to the read-only
+# grant list is not the fix — a GRANT on a table that does not exist fails too,
+# and it would fail after the REVOKE that precedes it, leaving the read-only
+# user with no SELECT grants at all. Restore an entry here only against a table
+# that exists and is in $roTables in hopsworks-helm's grants.sql.template.
 ACTUAL_SQL = {
     "features": ("(SELECT COUNT(*) FROM hopsworks.cached_feature)"
                  " + (SELECT COUNT(*) FROM hopsworks.on_demand_feature)"
                  " + (SELECT COUNT(*) FROM hopsworks.embedding_feature)"),
     "models": "(SELECT COUNT(*) FROM hopsworks.model)",
     "model deployments": "(SELECT COUNT(*) FROM hopsworks.serving)",
-    "agent deployments": "(SELECT COUNT(*) FROM hopsworks.agent)",
     "dashboards": "(SELECT COUNT(*) FROM hopsworks.dashboard)",
     "apps": "(SELECT COUNT(*) FROM hopsworks.jobs WHERE type = 'PYTHON_APP')",
 }

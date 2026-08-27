@@ -38,7 +38,11 @@ import time
 import warnings
 
 import hopsworks
-from hopsworks_common.client.exceptions import PlatformIntelligenceException
+from hopsworks_common.client.exceptions import (
+    PlatformIntelligenceException,
+    RestAPIError,
+)
+from hopsworks_common.core.tag_schemas_api import TagSchemasApi
 from hsfs.feature import Feature
 
 warnings.filterwarnings("ignore")
@@ -49,13 +53,54 @@ SOURCE_DB = "hopsworks"
 CONNECTOR = "hopsworks_analytics"
 VERSION = 1
 
+# The lifecycle tag the analytics dashboards read. Created here because this is the
+# first step of the setup flow that already has an admin's session: registering a tag
+# schema is admin-only, and the wizard that runs this is admin-only too.
+LIFECYCLE_TAG = "asset_lifecycle"
+
+# Registered with archiving ON. Without it the tag records only its current value, so
+# create_lifecycle_dashboard.py has nothing to chart: history starts when archiving is
+# switched on, and switching it on later backfills a baseline rather than recovering the
+# transitions that happened in between. Turning it on at creation is the only moment that
+# loses nothing.
+LIFECYCLE_ARCHIVE = True
+
+# The schema document. `name` is deliberately not a member: the registered name is
+# LIFECYCLE_TAG, passed as a query parameter, and carrying a second, different name inside
+# the body would leave two answers to what this tag is called.
+LIFECYCLE_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "description": "Status of AI assets in Hopsworks",
+    "type": "object",
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["deprecated", "dev", "qa", "uat", "prod"],
+        },
+        "owner": {
+            "type": "string",
+            "description": "Team accountable for the asset",
+        },
+    },
+    "required": ["status"],
+    "additionalProperties": False,
+}
+
 # Retry policy for transient LLM inference 500s (errorCode 520013).
 INFER_RETRIES = 4
 INFER_BACKOFF = 3  # seconds; multiplied by attempt number (3s, 6s, 9s, ...)
 
-# The exact list the user provided (table names concatenated, no separators).
+# The tables to mount (names concatenated, no separators).
+#
+# account_audit and userlogins are deliberately absent: they hold IPs, user agents and login outcomes, and the
+# read-only database user is not granted them. alert_receiver and trino_queries were removed for the same reason
+# and a sharper one: mounting a table samples its rows through infer_metadata, which sends them to the configured
+# model provider, and alert_receiver.config is the raw notification config (API keys, webhook URLs, routing keys)
+# while trino_queries holds query text, plans and the principal that ran them. Neither is read by any dashboard. Requesting them anyway did no harm (the grant refused, and the
+# script skips a table it cannot read) but it left this list asking for more than policy allows, so a later
+# widening of the grants would have mounted them silently and fed sample rows to the configured model provider.
 REQUESTED_BLOB = (
-    "account_auditactivityalert_receivercached_featurecached_feature_extra_constraints"
+    "activitycached_featurecached_feature_extra_constraints"
     "cached_feature_groupdata_sourcedatasetdataset_requestdataset_shared_withembedding"
     "embedding_featureenvironmentenvironment_historyenvironment_python_librariesexecutions"
     "expectationexpectation_suitefeature_descriptive_statisticsfeature_groupfeature_group_alert"
@@ -71,7 +116,11 @@ REQUESTED_BLOB = (
     "model_linkmodel_versionon_demand_featureon_demand_feature_groupon_demand_optionproject"
     "project_teamservingserving_depl_componentserving_deploymentserving_keyserving_model_artifact"
     "serving_remote_accessshared_featureshared_feature_groupshared_feature_storestream_feature_group"
-    "training_datasettransformation_functiontriggered_alerttrino_queriesuserloginsvalidation_result"
+    "training_datasettransformation_functiontriggered_alertvalidation_result"
+    # The tag surface. tag_history is the attachment history the lifecycle dashboards read; the
+    # other three are tag VALUE tables that predate this list's last revision and were never
+    # granted, so model, deployment and job tags were invisible to every dashboard.
+    "tag_historymodel_registry_tag_valuemodel_registry_mandatory_tagjob_tag_value"
 )
 
 
@@ -318,6 +367,63 @@ def create_one(fs, table_ds, tname: str, pi_state: dict) -> tuple[str, int]:
         return "information_schema", len(fg.features or [])
 
 
+# The backend's code for "that feature group is already there". Matched on the code rather than
+# the message, which is prose and has changed before.
+def ensure_lifecycle_tag() -> None:
+    """Register the lifecycle tag schema, unless it is already there.
+
+    Only ever creates. An existing schema is left exactly as it is, including its archive
+    flag: re-registering would mean deleting it, and deleting a tag schema cascades away
+    every attachment of it across every project. If it exists but is not archiving, that is
+    reported rather than changed, because turning archiving on is a decision with a cost
+    (it backfills a baseline) and it is not this script's to make.
+    """
+    api = TagSchemasApi()
+    try:
+        existing = api.get(LIFECYCLE_TAG)
+    except RestAPIError:
+        existing = None
+
+    if existing is not None:
+        archived = bool(existing.get("archive"))
+        print(f"Tag schema {LIFECYCLE_TAG!r} already exists -> left untouched")
+        if not archived:
+            print(
+                f"  ! it is NOT archiving, so tag_history records nothing for it and the\n"
+                f"    Asset Lifecycle dashboard will be empty. Turn it on when you are ready:\n"
+                f"    PUT /hopsworks-api/api/tags/{LIFECYCLE_TAG}/archive?value=true"
+            )
+        return
+
+    try:
+        api.create(LIFECYCLE_TAG, LIFECYCLE_SCHEMA, archive=LIFECYCLE_ARCHIVE)
+    except PermissionError as e:
+        # Registering a schema is admin-only. The wizard is too, so this should not happen;
+        # say what went wrong rather than failing the whole mount over it.
+        print(f"  ! could not create tag schema {LIFECYCLE_TAG!r}: {e}")
+        return
+    except Exception as exc:  # noqa: BLE001 - a tag schema must not fail the mount
+        print(f"  ! could not create tag schema {LIFECYCLE_TAG!r}: {exc}")
+        return
+
+    print(
+        f"Created tag schema {LIFECYCLE_TAG!r} "
+        f"(archiving {'on' if LIFECYCLE_ARCHIVE else 'off'}), "
+        f"statuses: {', '.join(LIFECYCLE_SCHEMA['properties']['status']['enum'])}"
+    )
+
+
+FG_ALREADY_EXISTS = 270089
+
+
+def already_exists(exc: Exception) -> bool:
+    """Whether a create failed only because the feature group was already there."""
+    code = getattr(exc, "error_code", None)
+    if code is not None:
+        return int(code) == FG_ALREADY_EXISTS
+    return str(FG_ALREADY_EXISTS) in str(exc)
+
+
 def has_fg(fs, tname: str):
     try:
         fg = fs.get_feature_group(tname, version=VERSION)
@@ -380,6 +486,11 @@ def main() -> None:
         requested = requested[: int(mode)]
         print(f"\n[test mode] limiting to first {len(requested)} table(s)")
 
+    # After the plan and verify returns above, so the read-only modes stay read-only.
+    print()
+    ensure_lifecycle_tag()
+    print()
+
     created, skipped, failed = [], [], []
     pi_state = {"enabled": None}  # one-time platform-intelligence probe cache
     for i, tname in enumerate(requested, 1):
@@ -395,8 +506,18 @@ def main() -> None:
             print(f"{prefix}: created ({nfeat} features, via {method})")
             created.append(tname)
         except Exception as exc:
-            failed.append((tname, str(exc)))
-            print(f"{prefix}: FAILED -> {str(exc)[:200]}")
+            if already_exists(exc):
+                # The check above and this create are two calls, so anything creating the same
+                # feature group in between wins and this one is told it already exists. That
+                # happens for real: the setup flow is re-runnable and the wizard can be driving
+                # a second session against the same project. It is the outcome we wanted anyway,
+                # so count it as a skip. Reporting it as a failure made a healthy run look like
+                # it had lost half the tables.
+                print(f"{prefix}: already exists (created concurrently) -> skip")
+                skipped.append(tname)
+            else:
+                failed.append((tname, str(exc)))
+                print(f"{prefix}: FAILED -> {str(exc)[:200]}")
 
     print("\n==================== SUMMARY ====================")
     print(f"created: {len(created)}  skipped: {len(skipped)}  failed: {len(failed)}")
