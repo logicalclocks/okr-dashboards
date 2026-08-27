@@ -20,7 +20,11 @@ sha256 over the same tuple the backend hashes, so the unique key still rejects a
 transition and the interval derivation still pairs OPENED with CLOSED. Seeding rows the reader
 would treat differently from real ones would make the dashboard a demo of itself.
 
+Executing requires `--demo-cluster`, because nothing about the invocation distinguishes a
+demo cluster from one whose history someone is reporting on.
+
 Run:  MYSQL_HOST=... MYSQL_USER=... MYSQL_PASSWORD=... python seed_promotion_history.py --emit-sql
+      ... python seed_promotion_history.py --demo-cluster
 """
 
 from __future__ import annotations
@@ -147,7 +151,22 @@ def main() -> int:
     )
     parser.add_argument("--emit-sql", action="store_true",
                         help="print the SQL instead of executing it")
+    parser.add_argument(
+        "--demo-cluster", action="store_true",
+        help="required to execute: confirms this cluster's real tag history is expendable",
+    )
     args = parser.parse_args()
+
+    # The first statement is an unconditional DELETE of every event for the tag, and the
+    # rows it replaces are backdated fiction. Nothing about the invocation distinguishes a
+    # demo cluster from one whose history someone is reporting on, so it has to be asserted
+    # rather than inferred. --emit-sql is exempt: printing destroys nothing.
+    if not args.emit_sql and not args.demo_cluster:
+        sys.exit(
+            f"Refusing to run: this DELETEs every {TAG!r} event in hopsworks.tag_history "
+            "and replaces it with synthetic backdated journeys. Pass --demo-cluster to "
+            "confirm that is what you want here, or --emit-sql to see the SQL first."
+        )
 
     if args.assets_tsv:
         assets = []
@@ -196,7 +215,9 @@ def main() -> int:
                 cur.execute(statement)
     finally:
         conn.close()
-    print(f"seeded {len(sql) - 1} event(s) across {len(assets)} asset(s)")
+    print(f"deleted the existing {TAG!r} history and seeded {len(sql) - 1} synthetic "
+          f"event(s) across {len(assets)} asset(s). Every duration on the Asset Promotion "
+          f"Time and Asset Lifecycle dashboards is now demo data.")
     return 0
 
 

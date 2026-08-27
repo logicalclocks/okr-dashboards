@@ -54,10 +54,6 @@ DASHBOARD_TITLE = "Asset Lifecycle"
 DEFAULT_TAG = "asset_lifecycle"
 DEFAULT_FIELD = "status"
 
-# The order states are meant to be traversed in. Used to sort charts so the columns read
-# dev -> qa -> prod rather than alphabetically, and to decide what "promoted" means.
-STAGE_ORDER = ["dev", "qa", "uat", "prod"]
-
 
 def intervals_sql(tag_name: str, tag_key: str) -> str:
     """One row per (asset, state) interval, with the asset kind resolved.
@@ -242,6 +238,28 @@ def report_coverage(superset: Superset, tag_name: str, tag_key: str) -> int:
     return total
 
 
+def provenance_note(tag_name: str, tag_key: str) -> str:
+    """What a dwell time on this dashboard is measured from, and what it is not."""
+    return "\n".join([
+        "### How these numbers are derived",
+        "",
+        f"One row per asset and state, from the `{tag_name}` tag's `{tag_key}` history in "
+        "`hopsworks.tag_history`. A dwell is how long an asset **sat in one state**: from "
+        "the event that opened it to the next event on that key, or to now if it is still "
+        "open. That is a different question from how long promotion takes, which is the "
+        "*Asset Promotion Time* dashboard.",
+        "",
+        "History exists only from the moment archiving was turned on for the schema, and "
+        "turning it on backfills a baseline rather than recovering transitions that already "
+        "happened. An open interval on a deleted asset is closed at the delete, so nothing "
+        "here grows against a clock forever.",
+        "",
+        "> On demo clusters this history may have been written by "
+        "`seed_promotion_history.py`, whose rows are deliberately indistinguishable from "
+        "observed ones. If you did not run it against this cluster, these are observed.",
+    ])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tag", default=DEFAULT_TAG, help="lifecycle tag schema name")
@@ -266,6 +284,7 @@ def main() -> int:
         host=project.get_url() if hasattr(project, "get_url") else None,
         # Every chart reads the same dataset, which carries project_name, so nothing is excluded.
         filters=lambda dataset_id: [project_filter(dataset_id)],
+        note=provenance_note(args.tag, args.field),
     )
     print(
         "\nNote: Hopsworks apps are not covered. They are not a taggable artifact "

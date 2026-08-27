@@ -30,10 +30,18 @@ This program:
 
 Run:  python create_executive_dashboard.py
 """
+import argparse
 import json
 import sys
 
 import hopsworks
+
+from superset import (
+    TERMINAL_STATUS,
+    lifecycle_status_values,
+    resolve_lifecycle_tag,
+    sql_str,
+)
 
 SCHEMA = "hopsworks"                       # MySQL schema holding the metadata tables
 OKRS_FG = "okrs"
@@ -91,14 +99,15 @@ ACTUAL_SQL = {
 # its `status` field (enum: deprecated / prod / rnd / uat), e.g.
 # {"status":"prod"}. fg_status is NULL for feature groups with no such tag.
 # Joined by tag name (not a hard-coded schema id) so it survives re-registration.
-FG_STATUS_SQL = (
-    "SELECT tv.feature_group_id,"
-    " JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS fg_status"
-    " FROM hopsworks.feature_store_tag_value tv"
-    " JOIN hopsworks.feature_store_tag t"
-    "   ON t.id = tv.schema_id AND t.name = 'asset'"
-    " WHERE tv.feature_group_id IS NOT NULL"
-)
+def fg_status_sql(tag):
+    return (
+        "SELECT tv.feature_group_id,"
+        " JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS fg_status"
+        " FROM hopsworks.feature_store_tag_value tv"
+        " JOIN hopsworks.feature_store_tag t"
+        f"   ON t.id = tv.schema_id AND t.name = {sql_str(tag)}"
+        " WHERE tv.feature_group_id IS NOT NULL"
+    )
 
 # One row per feature, carrying its feature group's `asset` value
 # (fg_status). Drives the feature KPI panels by COUNTing rows filtered on
@@ -114,7 +123,10 @@ FG_STATUS_SQL = (
 # value on fg_id. (Tags live on feature_group.id, so joining the subtype id
 # directly silently matches nothing.)
 FEATURE_STATUS_DATASET = "feature_okr_status"
-FEATURE_STATUS_SQL = f"""SELECT feature_id, feature_kind, s.fg_status FROM (
+def feature_status_sql(tag):
+    return f"""SELECT feature_id, feature_kind, s.fg_status,
+       COALESCE(p.projectname, '(unknown)') AS project_name
+FROM (
     SELECT cf.id AS feature_id, 'cached' AS feature_kind, fg.id AS fg_id
     FROM hopsworks.cached_feature cf
     JOIN hopsworks.feature_group fg
@@ -132,20 +144,24 @@ FEATURE_STATUS_SQL = f"""SELECT feature_id, feature_kind, s.fg_status FROM (
     FROM hopsworks.embedding_feature ef
     JOIN hopsworks.embedding e ON e.id = ef.embedding_id
 ) feats
-LEFT JOIN ({FG_STATUS_SQL}) s ON s.feature_group_id = feats.fg_id"""
+LEFT JOIN ({fg_status_sql(tag)}) s ON s.feature_group_id = feats.fg_id
+LEFT JOIN hopsworks.feature_group ownfg ON ownfg.id = feats.fg_id
+LEFT JOIN hopsworks.feature_store ownfs ON ownfs.id = ownfg.feature_store_id
+LEFT JOIN hopsworks.project p ON p.id = ownfs.project_id"""
 
 
 # One row per feature view + its own asset tag value (fv_status,
 # NULL when the FV carries no such tag). The tag can be attached to a feature
 # view via feature_store_tag_value.feature_view_id, mirroring the FG case.
-FV_STATUS_SQL = """SELECT fv.id AS fv_id, s.fv_status
+def fv_status_sql(tag):
+    return f"""SELECT fv.id AS fv_id, s.fv_status
 FROM hopsworks.feature_view fv
 LEFT JOIN (
     SELECT tv.feature_view_id,
            JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS fv_status
     FROM hopsworks.feature_store_tag_value tv
     JOIN hopsworks.feature_store_tag t
-      ON t.id = tv.schema_id AND t.name = 'asset'
+      ON t.id = tv.schema_id AND t.name = {sql_str(tag)}
     WHERE tv.feature_view_id IS NOT NULL
 ) s ON s.feature_view_id = fv.id"""
 # Backs the "Production Model Progression" KPI: COUNT(*) WHERE fv_status='prod'
@@ -157,18 +173,20 @@ FV_STATUS_DATASET = "fv_status"
 # each feature column of a feature view (feature_view_id set); we attach the
 # view's status. Used to count features-in-feature-views by status (not the
 # number of feature views).
-FV_FEATURE_STATUS_SQL = f"""SELECT tdf.id AS feature_id, fvs.fv_status
+def fv_feature_status_sql(tag):
+    return f"""SELECT tdf.id AS feature_id, fvs.fv_status
 FROM hopsworks.training_dataset_feature tdf
-JOIN ({FV_STATUS_SQL}) fvs ON fvs.fv_id = tdf.feature_view_id
+JOIN ({fv_status_sql(tag)}) fvs ON fvs.fv_id = tdf.feature_view_id
 WHERE tdf.feature_view_id IS NOT NULL"""
 
 # Prod-tagged feature views: the set of feature_view ids carrying the `asset`
 # tag with status='prod'. Reused below for both the reuse count and the
 # reuse-percentage series.
-_PROD_FV_IDS = """
+def prod_fv_ids(tag):
+    return f"""
         SELECT tv.feature_view_id FROM hopsworks.feature_store_tag_value tv
         JOIN hopsworks.feature_store_tag t
-          ON t.id = tv.schema_id AND t.name = 'asset'
+          ON t.id = tv.schema_id AND t.name = {sql_str(tag)}
         WHERE tv.feature_view_id IS NOT NULL
           AND JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) = 'prod'""".strip()
 
@@ -191,7 +209,8 @@ _TOTAL_FEATURES = ("(SELECT COUNT(*) FROM hopsworks.cached_feature)"
 #                       appears in any prod FV); denominator is the current total
 #                       feature count. Backs the secondary-axis percentage line.
 FEATURE_REUSE_DATASET = "feature_reuse_daily"
-FEATURE_REUSE_SQL = f"""SELECT d.day,
+def feature_reuse_sql(tag):
+    return f"""SELECT d.day,
        SUM(d.daily_count) OVER (ORDER BY d.day) AS cumulative_count,
        SUM(COALESCE(nf.new_features, 0)) OVER (ORDER BY d.day)
          / NULLIF({_TOTAL_FEATURES}, 0) AS reuse_pct
@@ -200,7 +219,7 @@ FROM (
     FROM hopsworks.training_dataset_feature tdf
     JOIN hopsworks.feature_view fv ON fv.id = tdf.feature_view_id
     WHERE tdf.feature_view_id IS NOT NULL
-      AND fv.id IN ({_PROD_FV_IDS})
+      AND fv.id IN ({prod_fv_ids(tag)})
     GROUP BY DATE(fv.created)
 ) d
 LEFT JOIN (
@@ -209,7 +228,7 @@ LEFT JOIN (
         FROM hopsworks.training_dataset_feature tdf
         JOIN hopsworks.feature_view fv ON fv.id = tdf.feature_view_id
         WHERE tdf.feature_view_id IS NOT NULL
-          AND fv.id IN ({_PROD_FV_IDS})
+          AND fv.id IN ({prod_fv_ids(tag)})
         GROUP BY tdf.name, tdf.feature_group
     ) ff
     GROUP BY first_day
@@ -222,23 +241,60 @@ ORDER BY d.day"""
 # re-sort by count); 'qa' is included even though it is not in the asset enum
 # (shows 0 until used), and 'deprecated' is intentionally excluded.
 FG_FUNNEL_DATASET = "fg_lifecycle_funnel"
-FG_FUNNEL_STAGES = [
-    ("untagged", "fs.fg_status IS NULL"),
-    ("rnd", "fs.fg_status = 'rnd'"),
-    ("uat", "fs.fg_status = 'uat'"),
-    ("qa", "fs.fg_status = 'qa'"),
-    ("prod", "fs.fg_status = 'prod'"),
-]
 
 
-def build_fg_funnel_sql():
-    rows = []
-    for i, (name, cond) in enumerate(FG_FUNNEL_STAGES, 1):
-        cnt = f"(SELECT COUNT(*) FROM ({FEATURE_STATUS_SQL}) fs WHERE {cond})"
-        rows.append(f"    SELECT {i} AS sort_order, '{i}. {name}' AS stage, "
-                    f"{cnt} AS cnt")
-    union = "\n    UNION ALL\n".join(rows)
-    return f"SELECT sort_order, stage, cnt FROM (\n{union}\n) t ORDER BY sort_order"
+def funnel_stages(status_values):
+    """(label, predicate) per funnel stage, from the values the tag schema declares.
+
+    `untagged` leads because an asset with no lifecycle tag has not entered the funnel.
+    `deprecated` is left out: it is where assets go, not a step on the way to production,
+    and including it would put a terminal state in the middle of a progression.
+    """
+    stages = [("untagged", "fs.fg_status IS NULL")]
+    stages += [(v, f"fs.fg_status = {sql_str(v)}")
+               for v in status_values if v != TERMINAL_STATUS]
+    return stages
+
+
+def build_fg_funnel_sql(tag, status_values):
+    """Feature counts per lifecycle stage, per project.
+
+    One pass grouped by (stage, project) rather than one scalar count per stage: with a
+    project dimension the old shape would have been five correlated counts for every
+    project on the cluster.
+
+    The zero-count seed keeps every stage on the chart when nothing has reached it, which
+    is what the numbered stage labels are for -- a stage that vanishes reads as a stage
+    that does not exist. The seed carries no project, so selecting one drops it, which is
+    the right answer: an empty stage in a filtered view is empty for that project.
+    """
+    order = "\n".join(f"                WHEN {cond} THEN {i}"
+                      for i, (_, cond) in enumerate(funnel_stages(status_values), 1))
+    label = "\n".join(f"                WHEN {cond} THEN '{i}. {name}'"
+                      for i, (name, cond) in enumerate(funnel_stages(status_values), 1))
+    seed = "\n    UNION ALL\n".join(
+        # The NULL comes from the column itself rather than a literal: `hopsworks` columns
+        # are latin1_general_cs while a literal takes the connection collation, and MySQL
+        # rejects the UNION outright ("Illegal mix of collations") rather than coercing.
+        f"    SELECT {i} AS sort_order, '{i}. {name}' AS stage,"
+        f" (SELECT seedp.projectname FROM hopsworks.project seedp WHERE 1 = 0)"
+        f" AS project_name, 0 AS cnt"
+        for i, (name, _) in enumerate(funnel_stages(status_values), 1))
+    return f"""SELECT sort_order, stage, project_name, cnt FROM (
+    SELECT CASE
+{order}
+           END AS sort_order,
+           CASE
+{label}
+           END AS stage,
+           fs.project_name AS project_name,
+           COUNT(*) AS cnt
+    FROM ({feature_status_sql(tag)}) fs
+    GROUP BY 1, 2, fs.project_name
+    HAVING sort_order IS NOT NULL
+    UNION ALL
+{seed}
+) t ORDER BY sort_order"""
 
 
 # Feature popularity: how many distinct feature views each feature is used in.
@@ -247,13 +303,16 @@ def build_fg_funnel_sql():
 # an integer (COUNT DISTINCT feature views). Backs the "Most Popular Features"
 # top-20 bar chart.
 FEATURE_POPULARITY_DATASET = "feature_popularity"
-FEATURE_POPULARITY_SQL = """SELECT feature, fv_count FROM (
+FEATURE_POPULARITY_SQL = """SELECT feature, project_name, fv_count FROM (
     SELECT CONCAT(tdf.name, ' (', COALESCE(fg.name, '?'), ')') AS feature,
+           COALESCE(p.projectname, '(unknown)') AS project_name,
            COUNT(DISTINCT tdf.feature_view_id) AS fv_count
     FROM hopsworks.training_dataset_feature tdf
     LEFT JOIN hopsworks.feature_group fg ON fg.id = tdf.feature_group
+    LEFT JOIN hopsworks.feature_store fs ON fs.id = fg.feature_store_id
+    LEFT JOIN hopsworks.project p ON p.id = fs.project_id
     WHERE tdf.feature_view_id IS NOT NULL
-    GROUP BY tdf.name, fg.name
+    GROUP BY tdf.name, fg.name, p.projectname
 ) t ORDER BY fv_count DESC"""
 
 # Model time-to-market velocity: per model version, the number of days between
@@ -265,22 +324,24 @@ FEATURE_POPULARITY_SQL = """SELECT feature, fv_count FROM (
 # per model version. ttm_days backs the TTM Velocity histogram. Negative spans
 # (model older than its FV — clock skew / re-registration) are dropped.
 MODEL_TTM_DATASET = "model_ttm_velocity"
-MODEL_TTM_SQL = """SELECT model_name, model_version, model_created, fv_created,
-       ttm_days
+MODEL_TTM_SQL = """SELECT model_name, project_name, model_version, model_created,
+       fv_created, ttm_days
 FROM (
     SELECT m.name AS model_name,
+           COALESCE(p.projectname, '(unknown)') AS project_name,
            mv.version AS model_version,
            mv.created AS model_created,
            MIN(fv.created) AS fv_created,
            DATEDIFF(mv.created, MIN(fv.created)) AS ttm_days
     FROM hopsworks.model_version mv
     JOIN hopsworks.model m ON m.id = mv.model_id
+    LEFT JOIN hopsworks.project p ON p.id = m.project_id
     JOIN hopsworks.model_link ml ON ml.model_version_id = mv.id
     JOIN hopsworks.feature_view fv
           ON fv.name = ml.parent_feature_view_name
          AND fv.version = ml.parent_feature_view_version
     WHERE mv.created IS NOT NULL
-    GROUP BY mv.id, m.name, mv.version, mv.created
+    GROUP BY mv.id, m.name, p.projectname, mv.version, mv.created
 ) t
 WHERE fv_created IS NOT NULL AND ttm_days >= 0
 ORDER BY ttm_days"""
@@ -298,24 +359,24 @@ ORDER BY ttm_days"""
 # subqueries; targets are embedded at build time. The deprecated segment is
 # hidden by default via a native filter.
 FEATURE_STACK_DATASET = "feature_target_stack"
-STATUS_ENUM = ["deprecated", "prod", "rnd", "uat"]
 
 
-def build_feature_stack_sql(feat_target, fv_target):
+def build_feature_stack_sql(feat_target, fv_target, tag, status_values):
     """Per population: an 'actual' bar stacked by asset value, plus
     a separate 'target' bar."""
     def rows(status_sql, alias, metric, target):
         def cnt(cond):
             return f"(SELECT COUNT(*) FROM ({status_sql}) {alias} WHERE {cond})"
         col = f"{alias}.{'fg_status' if alias == 'fs' else 'fv_status'}"
-        out = [(metric, "actual", s, cnt(f"{col} = '{s}'")) for s in STATUS_ENUM]
+        out = [(metric, "actual", v, cnt(f"{col} = {sql_str(v)}"))
+               for v in status_values]
         # untagged: no asset tag at all (LEFT JOIN leaves it NULL).
         out.append((metric, "actual", "untagged", cnt(f"{col} IS NULL")))
         out.append((metric, "target", "target", str(int(target))))
         return out
 
-    all_rows = (rows(FEATURE_STATUS_SQL, "fs", "features", feat_target)
-                + rows(FV_FEATURE_STATUS_SQL, "vs", "Feature Views", fv_target))
+    all_rows = (rows(feature_status_sql(tag), "fs", "features", feat_target)
+                + rows(fv_feature_status_sql(tag), "vs", "Feature Views", fv_target))
     union = "\n    UNION ALL\n".join(
         f"    SELECT '{metric}' AS metric, '{bar}' AS bar,"
         f" '{seg}' AS segment, ({val}) AS value"
@@ -762,7 +823,7 @@ def build_position_json(charts, title):
     return json.dumps(layout)
 
 
-def stack_segment_filter_metadata(ds_id, stack_chart_ids, all_chart_ids):
+def stack_segment_filter_metadata(ds_id, stack_chart_ids, all_chart_ids, status_values):
     """Native multi-select on the stacked-bar 'segment', scoped to the two
     stacked charts (features + feature views) only.
 
@@ -775,26 +836,54 @@ def stack_segment_filter_metadata(ds_id, stack_chart_ids, all_chart_ids):
     excluded = [cid for cid in all_chart_ids if cid not in keep]
     # All segment values except 'deprecated' (the default selection). 'target' is
     # the separate target bar's series and stays visible by default.
-    default_vals = [s for s in STATUS_ENUM if s != "deprecated"] + ["untagged", "target"]
-    return json.dumps({
-        "native_filter_configuration": [{
-            "id": "NATIVE_FILTER-stack_segment",
-            "name": "Status segments (deprecated off by default)",
-            "filterType": "filter_select", "type": "NATIVE_FILTER",
-            "targets": [{"datasetId": ds_id, "column": {"name": "segment"}}],
-            "controlValues": {"multiSelect": True, "enableEmptyFilter": False,
-                              "defaultToFirstItem": False, "inverseSelection": False,
-                              "searchAllOptions": False},
-            "scope": {"rootPath": ["ROOT_ID"], "excluded": excluded},
-            "defaultDataMask": {
-                "filterState": {"value": default_vals},
-                "extraFormData": {"filters": [
-                    {"col": "segment", "op": "IN", "val": default_vals}]},
-            },
-            "cascadeParentIds": [],
-        }],
-        "cross_filters_enabled": False,
-    })
+    default_vals = ([v for v in status_values if v != TERMINAL_STATUS]
+                    + ["untagged", "target"])
+    return {
+        "id": "NATIVE_FILTER-stack_segment",
+        "name": "Status segments (deprecated off by default)",
+        "filterType": "filter_select", "type": "NATIVE_FILTER",
+        "targets": [{"datasetId": ds_id, "column": {"name": "segment"}}],
+        "controlValues": {"multiSelect": True, "enableEmptyFilter": False,
+                          "defaultToFirstItem": False, "inverseSelection": False,
+                          "searchAllOptions": False},
+        "scope": {"rootPath": ["ROOT_ID"], "excluded": excluded},
+        "defaultDataMask": {
+            "filterState": {"value": default_vals},
+            "extraFormData": {"filters": [
+                {"col": "segment", "op": "IN", "val": default_vals}]},
+        },
+        "cascadeParentIds": [],
+    }
+
+
+def project_filter_metadata(dataset_id, scoped_chart_ids, all_chart_ids):
+    """Native multi-select on project, scoped to the charts whose datasets carry one.
+
+    Most of this dashboard cannot be sliced by project and it is not an oversight. Every
+    KPI panel and the stacked bar compare a live count against an OKR *target*, and the
+    targets in the `okrs` feature group are cluster-wide: filtering the actual while the
+    target stays whole turns "142 of 500" into a percentage that means nothing. Those
+    charts are excluded, so selecting a project leaves them reading what they always read.
+
+    The charts that are in scope are the ones that count things rather than compare them
+    to a target -- feature popularity, model time-to-market, the lifecycle funnel -- where
+    "in this project" is a question with an answer.
+    """
+    keep = set(scoped_chart_ids)
+    excluded = [cid for cid in all_chart_ids if cid not in keep]
+    return {
+        "id": "NATIVE_FILTER-project",
+        "name": "Project",
+        "filterType": "filter_select",
+        "type": "NATIVE_FILTER",
+        "targets": [{"datasetId": dataset_id, "column": {"name": "project_name"}}],
+        "controlValues": {"multiSelect": True, "enableEmptyFilter": False,
+                          "defaultToFirstItem": False, "inverseSelection": False,
+                          "searchAllOptions": False},
+        "scope": {"rootPath": ["ROOT_ID"], "excluded": excluded},
+        "defaultDataMask": {"filterState": {}, "extraFormData": {}},
+        "cascadeParentIds": [],
+    }
 
 
 def ensure_dashboard(api, title, charts, json_metadata=None):
@@ -817,11 +906,32 @@ def ensure_dashboard(api, title, charts, json_metadata=None):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser.add_argument(
+        "--tag",
+        help="lifecycle tag schema carrying the status field; resolved from the cluster "
+             "when omitted (see superset.LIFECYCLE_TAG_ORDER)",
+    )
+    args = parser.parse_args()
+
     project = hopsworks.login()
     api = project.get_superset_api()
 
     db_id, db_name = find_mysql_db_id(api)
     print(f"hopsworks_analytics connection: id={db_id} ({db_name})\n")
+
+    # Which tag schema carries the lifecycle status. Hardcoding 'asset' meant every status
+    # chart here rendered empty on a cluster that names it anything else, with no error:
+    # a tag name that does not exist is a join that matches nothing, not a failure.
+    tag = resolve_lifecycle_tag(lambda sql: run_sql(api, db_id, sql), args.tag)
+    if tag is None:
+        sys.exit(
+            "No lifecycle tag schema on this cluster, so every status-based chart would "
+            "be empty. Run mount_hopsworks_db.py to create 'asset_lifecycle', or pass "
+            "--tag."
+        )
+    status_values = lifecycle_status_values(lambda sql: run_sql(api, db_id, sql), tag)
+    print(f"Lifecycle tag: {tag!r} -> {', '.join(status_values)}\n")
 
     targets = load_targets(project)
     print("OKR targets (from the okrs feature group):")
@@ -843,7 +953,7 @@ def main():
 
     # Feature-grain dataset (one row per feature + its asset value)
     # backing the Active / Feature OKR Progression KPI panels.
-    feat_ds_id = ensure_dataset(api, db_id, FEATURE_STATUS_DATASET, FEATURE_STATUS_SQL)
+    feat_ds_id = ensure_dataset(api, db_id, FEATURE_STATUS_DATASET, feature_status_sql(tag))
     print(f"Dataset '{FEATURE_STATUS_DATASET}' ready (id={feat_ds_id}).")
 
     # Stacked dataset: features (vs features target) + Feature Views (vs models
@@ -852,17 +962,17 @@ def main():
     fv_target = int(targets.get("models", 0))
     stack_ds_id = ensure_dataset(
         api, db_id, FEATURE_STACK_DATASET,
-        build_feature_stack_sql(feat_target, fv_target))
+        build_feature_stack_sql(feat_target, fv_target, tag, status_values))
     print(f"Dataset '{FEATURE_STACK_DATASET}' ready (id={stack_ds_id}).")
 
     # Daily feature-reuse time series (features added to prod-tagged feature views).
     reuse_ds_id = ensure_dataset(
-        api, db_id, FEATURE_REUSE_DATASET, FEATURE_REUSE_SQL)
+        api, db_id, FEATURE_REUSE_DATASET, feature_reuse_sql(tag))
     print(f"Dataset '{FEATURE_REUSE_DATASET}' ready (id={reuse_ds_id}).")
 
     # Feature-group lifecycle funnel dataset (feature counts by asset status).
     fg_funnel_ds_id = ensure_dataset(
-        api, db_id, FG_FUNNEL_DATASET, build_fg_funnel_sql())
+        api, db_id, FG_FUNNEL_DATASET, build_fg_funnel_sql(tag, status_values))
     print(f"Dataset '{FG_FUNNEL_DATASET}' ready (id={fg_funnel_ds_id}).")
 
     # Feature popularity dataset (distinct feature-view usage per feature).
@@ -871,7 +981,7 @@ def main():
     print(f"Dataset '{FEATURE_POPULARITY_DATASET}' ready (id={popularity_ds_id}).")
 
     # Feature-view status dataset (one row per FV + its asset status).
-    fv_status_ds_id = ensure_dataset(api, db_id, FV_STATUS_DATASET, FV_STATUS_SQL)
+    fv_status_ds_id = ensure_dataset(api, db_id, FV_STATUS_DATASET, fv_status_sql(tag))
     print(f"Dataset '{FV_STATUS_DATASET}' ready (id={fv_status_ds_id}).")
 
     # Model time-to-market dataset (days from FV created to model created).
@@ -895,7 +1005,9 @@ def main():
             print(f"Deleted retired chart '{name}' (id={c['id']})")
 
     print("\nCreating charts:")
-    charts, stack_chart_ids = [], []
+    charts, stack_chart_ids, project_chart_ids = [], [], []
+    # The charts whose datasets carry project_name; see project_filter_metadata.
+    project_scoped = {MOST_POPULAR_CHART, MODEL_TTM_CHART, FG_FUNNEL_CHART}
     for slice_name, viz_type, params, width, height in chart_specs(targets):
         if slice_name == FEATURE_STACK_CHART:
             chart_ds = stack_ds_id
@@ -918,12 +1030,21 @@ def main():
         cid = replace_chart(api, slice_name, viz_type, chart_ds, params)
         if slice_name == FEATURE_STACK_CHART:
             stack_chart_ids.append(cid)
+        if slice_name in project_scoped:
+            project_chart_ids.append(cid)
         charts.append({"id": cid, "name": slice_name,
                        "width": width, "height": height})
         print(f"  [{viz_type}] {slice_name} -> id={cid}")
 
-    json_metadata = stack_segment_filter_metadata(
-        stack_ds_id, stack_chart_ids, [c["id"] for c in charts])
+    all_chart_ids = [c["id"] for c in charts]
+    json_metadata = json.dumps({
+        "native_filter_configuration": [
+            stack_segment_filter_metadata(stack_ds_id, stack_chart_ids, all_chart_ids,
+                                          status_values),
+            project_filter_metadata(popularity_ds_id, project_chart_ids, all_chart_ids),
+        ],
+        "cross_filters_enabled": False,
+    })
     dash_id = ensure_dashboard(api, DASHBOARD_TITLE, charts, json_metadata)
     print(f"\nDashboard '{DASHBOARD_TITLE}' ready (id={dash_id}).")
     print(f"Open it: {host}/hopsworks-api/superset/superset/dashboard/{dash_id}/")

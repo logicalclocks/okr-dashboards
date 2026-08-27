@@ -21,8 +21,11 @@ Reads `hopsworks.tag_history`, so it needs a tag schema with archiving on. `asse
 created that way by mount_hopsworks_db.py. A schema without it records nothing, and the script
 says so rather than building empty charts.
 
+The stages come from the tag schema's own `status` enum unless `--stages` overrides them,
+so the dashboard measures the progression the cluster actually defines.
+
 Run:  python create_promotion_dashboard.py [--tag asset_lifecycle] [--field status]
-                                           [--stages dev,uat,prod]
+                                           [--stages dev,uat,prod] [--series project_name]
 """
 
 from __future__ import annotations
@@ -33,9 +36,11 @@ import sys
 import hopsworks
 
 from superset import (
+    TERMINAL_STATUS,
     ChartSpec,
     Superset,
     categorical_bar,
+    lifecycle_status_values,
     project_filter,
     simple_filter,
     sql_metric,
@@ -47,7 +52,6 @@ DASHBOARD_TITLE = "Asset Promotion Time"
 
 DEFAULT_TAG = "asset_lifecycle"
 DEFAULT_FIELD = "status"
-DEFAULT_STAGES = "dev,uat,prod"
 
 
 def transitions_sql(tag_name: str, tag_key: str, stages: list[str]) -> str:
@@ -248,6 +252,37 @@ def chart_specs(stages: list[str], series: str) -> list[ChartSpec]:
     ]
 
 
+def provenance_note(tag_name: str, tag_key: str, stages: list[str]) -> str:
+    """What these durations are, and what they are not.
+
+    "37 days to production" is the kind of number that gets quoted in a meeting, and by then
+    nobody remembers that the cluster it came from was seeded. The dashboard is where the
+    caveat belongs, because the dashboard is what gets read.
+    """
+    return "\n".join([
+        "### How these numbers are derived",
+        "",
+        f"One row per asset and transition, from the `{tag_name}` tag's `{tag_key}` history "
+        f"in `hopsworks.tag_history`. A transition is the time between an asset **first** "
+        f"entering one stage and first entering the next, over `"
+        + " -> ".join(stages) + "`.",
+        "",
+        "Only forward moves count, and only completed ones: an asset still in `"
+        + stages[0] + "` contributes to no average, and a rollback contributes nothing "
+        "rather than a negative. So a fast average can mean the slow assets have not "
+        "arrived yet -- read it next to *Assets completing each transition*.",
+        "",
+        "History exists only from the moment archiving was turned on for the schema. "
+        "Turning it on backfills a baseline, not the transitions that already happened.",
+        "",
+        "> On demo clusters this history may have been written by "
+        "`seed_promotion_history.py`, which backdates synthetic journeys because real ones "
+        "made seconds apart leave every duration at zero. Seeded rows are deliberately "
+        "indistinguishable from observed ones. If you did not run it against this cluster, "
+        "these are observed.",
+    ])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tag", default=DEFAULT_TAG, help="lifecycle tag schema name")
@@ -260,19 +295,28 @@ def main() -> int:
     )
     parser.add_argument(
         "--stages",
-        default=DEFAULT_STAGES,
-        help="stage names in promotion order, comma separated",
+        help="stage names in promotion order, comma separated; taken from the tag "
+             "schema's own enum when omitted",
     )
     args = parser.parse_args()
-
-    stages = [s.strip() for s in args.stages.split(",") if s.strip()]
-    if len(stages) < 2:
-        parser.error("--stages needs at least two stages to measure a transition between")
 
     project = hopsworks.login()
     superset = Superset.connect(project.get_superset_api())
     print(f"hopsworks_analytics connection: id={superset.database_id} "
           f"({superset.database_name})\n")
+
+    # Read the stages off the schema rather than assuming them. The two lifecycle schemas
+    # in the wild disagree (`asset_lifecycle` has dev, `asset` has rnd), and a journey
+    # measured over a stage the schema does not have is not a slow journey, it is no rows.
+    if args.stages:
+        stages = [s.strip() for s in args.stages.split(",") if s.strip()]
+    else:
+        stages = [v for v in lifecycle_status_values(superset.sql, args.tag, args.field)
+                  if v != TERMINAL_STATUS]
+    if len(stages) < 2:
+        parser.error("need at least two stages to measure a transition between; "
+                     f"got {stages}")
+    print(f"Stages: {' -> '.join(stages)}")
 
     statement = transitions_sql(args.tag, args.field, stages)
 
@@ -305,6 +349,7 @@ def main() -> int:
         specs=chart_specs(stages, args.series),
         # Every chart here has project_name, so the filter needs no exclusions.
         filters=lambda dataset_id: [project_filter(dataset_id)],
+        note=provenance_note(args.tag, args.field, stages),
     )
     return 0
 

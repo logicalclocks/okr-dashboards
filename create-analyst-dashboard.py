@@ -12,7 +12,7 @@ This MERGES the two former dashboards into one analyst-facing view:
 
   * feature_usage_dashboard.py  -> "Feature Usage & Reuse"
         feature REUSE across feature views and models, plus the count of
-        features in `sdlc`-tagged feature groups broken down by status.
+        features in lifecycle-tagged feature groups broken down by status.
 
 Everything reads the underlying `hopsworks.*` MySQL tables (which also happen
 to be mounted as feature groups in this project) through the one pre-provisioned
@@ -25,13 +25,16 @@ DATASETS
   feature_group_feature_usage      (physical) per-feature usage summary.
   feature_group_feature_usage_..._view  (physical) one row per (feature, FV).
   feature_group_feature_usage_model     (physical) one row per (feature, model).
-  sdlc_tagged_feature_counts       (virtual) one row per `sdlc`-tagged FG.
+  lifecycle_tagged_feature_counts  (virtual) one row per lifecycle-tagged FG.
+                                    The tag schema is resolved from the cluster
+                                    (--tag overrides); the chart is skipped when
+                                    the cluster has none.
 
 NATIVE FILTER SELECTION BOXES
 -----------------------------
 Three native filters (Tag, Tag value, Feature group kind) are scoped to ONLY
 the feature-group-activity charts (they read the `feature_group_inventory`
-dataset). The usage / reuse / sdlc charts are excluded from those filters
+dataset). The usage / reuse / status charts are excluded from those filters
 because their datasets don't carry the tag columns.
 
 Idempotent (list-then-create/update, replace-charts-by-name under the
@@ -41,11 +44,13 @@ prefix so re-running never disturbs the standalone dashboards.
 
 Run:  python analyst_dashboard.py
 """
+import argparse
 import json
 
 import hopsworks
 
 # Reuse the shared Superset plumbing from the tag-dashboard builder.
+from superset import resolve_lifecycle_tag
 from create_tag_dataset import (
     SCHEMA,
     build_position_json,
@@ -67,15 +72,18 @@ INVENTORY_DATASET = "feature_group_inventory"
 T_SUMMARY = "feature_group_feature_usage"
 T_FV = "feature_group_feature_usage_feature_view"
 T_MODEL = "feature_group_feature_usage_model"
-SDLC_DATASET = "sdlc_tagged_feature_counts"
+STATUS_DATASET = "lifecycle_tagged_feature_counts"
 
-# Virtual (SQL-backed) dataset: one row per feature group that carries the
-# `sdlc` schematized tag, exposing the tag's `status` value and the number of
-# features in that feature group.
-SDLC_DATASET_SQL = f"""
+# Virtual (SQL-backed) dataset: one row per feature group carrying the lifecycle
+# tag, exposing the tag's `status` value and the number of features in that feature
+# group. The tag name is resolved against the cluster rather than hardcoded: this
+# used to read 'sdlc', which exists on no cluster this repo currently targets, so the
+# chart rendered empty everywhere with nothing to say why.
+def status_dataset_sql(tag_name):
+    return f"""
 SELECT fg.id AS feature_group_id,
        fg.name AS feature_group_name,
-       JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS sdlc_status,
+       JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS status,
        (SELECT COUNT(*) FROM {SCHEMA}.cached_feature cf
           WHERE cf.cached_feature_group_id = fg.cached_feature_group_id
              OR cf.stream_feature_group_id = fg.stream_feature_group_id)
@@ -83,10 +91,15 @@ SELECT fg.id AS feature_group_id,
           WHERE odf.on_demand_feature_group_id = fg.on_demand_feature_group_id)
          AS n_features
 FROM {SCHEMA}.feature_store_tag_value tv
-JOIN {SCHEMA}.feature_store_tag t ON t.id = tv.schema_id AND t.name = 'sdlc'
+JOIN {SCHEMA}.feature_store_tag t ON t.id = tv.schema_id AND t.name = {sql_str(tag_name)}
 JOIN {SCHEMA}.feature_group fg ON fg.id = tv.feature_group_id
 WHERE tv.feature_group_id IS NOT NULL
 """.strip()
+
+
+# Charts this builder used to create under a hardcoded tag name. Deleted on every run so
+# renaming the chart does not leave the old one behind in Superset.
+RETIRED_CHARTS = ["Features in sdlc-tagged feature groups by status"]
 
 
 # --------------------------------------------------------------------------- #
@@ -263,7 +276,7 @@ def native_filter(fid, name, ds_id, column, multi, excluded, default_first=False
             "defaultToFirstItem": default_first, "inverseSelection": False,
             "searchAllOptions": False,
         },
-        # excluded: chart ids whose datasets lack the tag columns (usage/sdlc).
+        # excluded: chart ids whose datasets lack the tag columns (usage/status).
         "scope": {"rootPath": ["ROOT_ID"], "excluded": excluded},
         "defaultDataMask": {"filterState": {}, "extraFormData": {}},
         "cascadeParentIds": [],
@@ -283,7 +296,7 @@ def build_json_metadata(ds_id, excluded):
             native_filter("fgkind", "Feature group kind", ds_id, "fg_kind",
                           multi=True, excluded=excluded),
             # Slice the whole dashboard by project. Same exclusions as the others: the usage
-            # and sdlc datasets do not carry the column, and a filter over a column a chart
+            # and status datasets do not carry the column, and a filter over a column a chart
             # cannot see makes that chart error rather than ignore it.
             native_filter("project", "Project", ds_id, "project_name",
                           multi=True, excluded=excluded),
@@ -313,6 +326,14 @@ def ensure_dashboard(api, title, charts, json_metadata):
 
 # --------------------------------------------------------------------------- #
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser.add_argument(
+        "--tag",
+        help="lifecycle tag schema for the status chart; resolved from the cluster when "
+             "omitted (see superset.LIFECYCLE_TAG_ORDER)",
+    )
+    args = parser.parse_args()
+
     project = hopsworks.login()
     api = project.get_superset_api()
 
@@ -336,9 +357,24 @@ def main():
     ds_summary = ensure_physical_dataset(api, db_id, T_SUMMARY)
     ds_fv = ensure_physical_dataset(api, db_id, T_FV)
     ds_model = ensure_physical_dataset(api, db_id, T_MODEL)
-    ds_sdlc = ensure_dataset(api, db_id, SDLC_DATASET, SDLC_DATASET_SQL)
-    print(f"Usage datasets ready: summary={ds_summary} fv={ds_fv} "
-          f"model={ds_model} sdlc={ds_sdlc}\n")
+    status_tag = resolve_lifecycle_tag(lambda sql: run_sql(api, db_id, sql), args.tag)
+    if status_tag:
+        ds_status = ensure_dataset(api, db_id, STATUS_DATASET,
+                                   status_dataset_sql(status_tag))
+        print(f"Lifecycle tag: {status_tag!r} (dataset {STATUS_DATASET} id={ds_status})")
+    else:
+        # No lifecycle tag on this cluster. The chart is dropped rather than built over a
+        # join that matches nothing, which is what an empty chart with no explanation is.
+        ds_status = None
+        print("No lifecycle tag schema on this cluster; the status chart is skipped. "
+              "Run mount_hopsworks_db.py to create 'asset_lifecycle'.")
+    print(f"Usage datasets ready: summary={ds_summary} fv={ds_fv} model={ds_model}\n")
+
+    for retired in RETIRED_CHARTS:
+        for chart in list_all(api, "chart"):
+            if chart.get("slice_name") == f"{PREFIX}{retired}":
+                api.delete_chart(chart["id"])
+                print(f"Deleted retired chart {chart['slice_name']!r}")
 
     # --- Charts ------------------------------------------------------------- #
     charts = []           # ordered list of {id, name, width, height} for layout
@@ -384,7 +420,7 @@ def main():
          "adhoc_filters": [], "row_limit": 2000, "order_by_cols": [],
          "table_timestamp_format": "smart_date"}, 12, 60, inventory=True)
 
-    # ===== Feature Usage & Reuse (physical usage tables + sdlc) ============= #
+    # ===== Feature Usage & Reuse (physical usage tables + lifecycle tag) ==== #
     add("Feature→FeatureView usages", "big_number_total", ds_fv,
         {"metric": COUNT, "adhoc_filters": [], "y_axis_format": "SMART_NUMBER",
          "subheader": "feature uses across all feature views"}, 6, 30)
@@ -404,12 +440,14 @@ def main():
                             "sqlExpression": "models_count > 0", "clause": "WHERE"}],
          "x_axis_title": "# models using a feature", "y_axis_title": "# features",
          "x_axis_format": "SMART_NUMBER", "y_axis_format": "SMART_NUMBER"}, 12, 55)
-    add("Features in sdlc-tagged feature groups by status", "echarts_timeseries_bar",
-        ds_sdlc, {**bar("sdlc_status", SUM_FEATURES, limit=25),
-                  "x_axis_title": "sdlc status", "y_axis_title": "# features"}, 12, 55)
+    if ds_status is not None:
+        add(f"Features by {status_tag} status", "echarts_timeseries_bar",
+            ds_status, {**bar("status", SUM_FEATURES, limit=25),
+                        "x_axis_title": f"{status_tag} status",
+                        "y_axis_title": "# features"}, 12, 55)
 
     # --- Dashboard ---------------------------------------------------------- #
-    # Tag/kind filters target the inventory dataset; exclude the usage/sdlc
+    # Tag/kind filters target the inventory dataset; exclude the usage/status
     # charts (their datasets don't carry tag_field / tag_value / fg_kind).
     excluded = [c["id"] for c in charts if c["id"] not in inventory_cids]
     json_metadata = build_json_metadata(ds_inv, excluded)

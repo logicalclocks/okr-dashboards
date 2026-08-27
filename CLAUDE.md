@@ -72,6 +72,15 @@ If the user answers yes, then run the python programs to create the dashboards: 
 'create-analyst-dashboard.py' builds the analyst dashboard covering feature/feature-group counts and growth over time, with native filter "selection boxes" (Tag, Tag value, Feature group kind) that let you slice/group the feature data by tag values mirrored from the 'feature_store_tags_by_value' virtual dataset. It reuses the shared Superset helpers in create_tag_dataset.py, is idempotent, and disables result caching — re-run it anytime to refresh. It supersedes the removed 'feature_group_dashboard.py' and 'feature_usage_dashboard.py'; do not try to run those.
 
 
+No builder hardcodes a lifecycle tag name any more. `superset.resolve_lifecycle_tag` picks the
+first schema the cluster actually has from `asset_lifecycle`, `asset`, `sdlc`, `lifecycle_status`,
+and every builder takes `--tag` to override it. `superset.lifecycle_status_values` then reads that
+schema's `status` enum for the stage list. Both were hardcoded before and both failed the same
+silent way: the analyst dashboard charted `sdlc`, which exists on no current cluster, and the
+executive dashboard's stage list omitted `dev`, hiding 81 features that were in it. A tag name or
+a stage value that does not exist is not an error to Superset. It is a join that matches nothing,
+and it renders as an empty chart with nothing to say why.
+
 'superset.py' is the library the dashboard builders share: connecting to the analytics database,
 registering a virtual dataset, (re)creating charts and laying them out. It has no dashboard of its
 own and is not run directly. Import from it rather than from another builder script, which is what
@@ -116,7 +125,12 @@ and derives its data differently. That one measures dwell, how long an asset sit
 one row per interval. This one measures the journey: per asset, the time between first entering
 one stage and first entering the next, so `dev -> prod` is a single number however many stages or
 detours it passed through. Average, longest, distribution, how many complete each step, the trend
-by week, and the slowest journeys. Pass `--stages` for a different path (default dev,uat,prod).
+by week, and the slowest journeys.
+
+The stages come from the tag schema's own `status` enum, minus `deprecated` (a terminal state, not
+a step towards production). `--stages` overrides them. They used to be hardcoded to
+`dev,uat,prod`, which skipped `qa` on the schema that has it and measured a transition no asset
+makes.
 
 Stage entry is the FIRST entry, not the last: an asset demoted from prod and promoted again has
 entered prod twice, and taking the later one would report the round trip as its time to
@@ -132,6 +146,15 @@ existing history first so the result is one coherent set of journeys rather than
 interleaved with real ones. The rows it writes carry a correctly computed event_id, so the unique
 key and the interval derivation treat them exactly like rows the backend wrote.
 
+Executing it requires `--demo-cluster`. The first thing it does is delete every event for the tag,
+and nothing about the invocation distinguishes a demo cluster from one whose history someone is
+reporting on. `--emit-sql` prints the statements without running them and needs no confirmation.
+
+Because seeded rows are indistinguishable by design, both lifecycle dashboards carry a note saying
+what their numbers are derived from and that a `seed_promotion_history.py` run would make them
+synthetic. A duration like "37 days to production" gets quoted in meetings long after anyone
+remembers which cluster it came from.
+
 
 Every dashboard here carries a **Project** selection box, so any chart can be sliced to one
 project or compared across several. It is a native filter built by `superset.project_filter`,
@@ -142,7 +165,9 @@ The Asset Promotion Time dashboard goes further and takes `--series project_name
 the duration bars down by project instead of by asset kind. They answer different questions of the
 same data: asset kind says what is slow, project says who is slow.
 
-The Executive OKR dashboard deliberately has no project filter. Its charts are cluster-wide counts
-compared against targets from the `okrs` feature group, which has no project dimension, so slicing
-the actuals by project would put a per-project number next to a cluster-wide target and invite the
-comparison to be read as a shortfall.
+The Executive OKR dashboard has a project filter too, but scoped rather than global. It applies to
+the charts that count things (feature popularity, model time-to-market, the lifecycle funnel) and
+is excluded from the ones that compare a count against a target. Targets come from the `okrs`
+feature group and have no project dimension, so filtering the actual while the target stays whole
+turns "142 of 500" into a percentage that means nothing. Those charts keep reading cluster-wide
+whatever is selected.
