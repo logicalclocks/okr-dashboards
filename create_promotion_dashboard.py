@@ -36,6 +36,7 @@ from superset import (
     ChartSpec,
     Superset,
     categorical_bar,
+    project_filter,
     simple_filter,
     sql_metric,
     sql_str,
@@ -134,21 +135,27 @@ assets AS (
 """.strip()
 
 
-def chart_specs(stages: list[str]) -> list[ChartSpec]:
-    """Average, worst case, spread, and the assets behind them."""
+def chart_specs(stages: list[str], series: str) -> list[ChartSpec]:
+    """Average, worst case, spread, and the assets behind them.
+
+    `series` is the dimension the bars are broken down by: asset kind answers "what is slow",
+    project answers "who is slow", and they are different questions asked of the same data. It is
+    a parameter rather than two sets of charts because the only thing that differs is one field.
+    """
     mean_days = sql_metric("AVG(days)", "avg days")
     max_days = sql_metric("MAX(days)", "max days")
     assets = sql_metric("COUNT(DISTINCT artifact_id)", "assets")
     end_to_end = f"{stages[0]} -> {stages[-1]}"
+    by = f" by {series.replace('_', ' ')}"
 
     return [
         ChartSpec(
-            name="Promotion · Average days per transition",
+            name=f"Promotion · Average days per transition{by}",
             viz_type="echarts_timeseries_bar",
             width=6,
             params=categorical_bar(
                 x_axis="transition",
-                series="asset_kind",
+                series=series,
                 metrics=[mean_days],
                 y_axis_format=",.2f",
             ),
@@ -156,12 +163,12 @@ def chart_specs(stages: list[str]) -> list[ChartSpec]:
         # The worst case, next to the average, because a mean alone hides the asset that took
         # a quarter and is usually the reason anyone opens this dashboard.
         ChartSpec(
-            name="Promotion · Longest days per transition",
+            name=f"Promotion · Longest days per transition{by}",
             viz_type="echarts_timeseries_bar",
             width=6,
             params=categorical_bar(
                 x_axis="transition",
-                series="asset_kind",
+                series=series,
                 metrics=[max_days],
                 y_axis_format=",.2f",
             ),
@@ -176,7 +183,7 @@ def chart_specs(stages: list[str]) -> list[ChartSpec]:
             params={
                 "viz_type": "histogram_v2",
                 "column": "days",
-                "groupby": [],
+                "groupby": [series],
                 "bins": 20,
                 "row_limit": 50000,
                 "normalize": False,
@@ -190,13 +197,13 @@ def chart_specs(stages: list[str]) -> list[ChartSpec]:
         ),
         # How many complete each step at all: a transition nobody makes is not a fast one.
         ChartSpec(
-            name="Promotion · Assets completing each transition",
+            name=f"Promotion · Assets completing each transition{by}",
             viz_type="echarts_timeseries_bar",
             width=6,
             height=55,
             params=categorical_bar(
                 x_axis="transition",
-                series="asset_kind",
+                series=series,
                 metrics=[assets],
             ),
         ),
@@ -210,7 +217,7 @@ def chart_specs(stages: list[str]) -> list[ChartSpec]:
                 "x_axis": "reached",
                 "time_grain_sqla": "P1W",
                 "metrics": [mean_days],
-                "groupby": ["transition"],
+                "groupby": ["transition", series] if series != "transition" else ["transition"],
                 "adhoc_filters": [],
                 "row_limit": 1000,
                 "y_axis_format": ",.2f",
@@ -245,6 +252,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tag", default=DEFAULT_TAG, help="lifecycle tag schema name")
     parser.add_argument("--field", default=DEFAULT_FIELD, help="field holding the stage")
+    parser.add_argument(
+        "--series",
+        default="asset_kind",
+        choices=["asset_kind", "project_name"],
+        help="dimension the bars break down by: what is slow, or who is slow",
+    )
     parser.add_argument(
         "--stages",
         default=DEFAULT_STAGES,
@@ -289,7 +302,9 @@ def main() -> int:
         dataset=DATASET,
         title=DASHBOARD_TITLE,
         statement=statement,
-        specs=chart_specs(stages),
+        specs=chart_specs(stages, args.series),
+        # Every chart here has project_name, so the filter needs no exclusions.
+        filters=lambda dataset_id: [project_filter(dataset_id)],
     )
     return 0
 

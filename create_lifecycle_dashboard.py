@@ -42,6 +42,7 @@ from superset import (
     ChartSpec,
     Superset,
     categorical_bar,
+    project_filter,
     simple_filter,
     sql_metric,
     sql_str,
@@ -263,6 +264,8 @@ def main() -> int:
         statement=intervals_sql(args.tag, args.field),
         specs=chart_specs(),
         host=project.get_url() if hasattr(project, "get_url") else None,
+        # Every chart reads the same dataset, which carries project_name, so nothing is excluded.
+        filters=lambda dataset_id: [project_filter(dataset_id)],
     )
     print(
         "\nNote: Hopsworks apps are not covered. They are not a taggable artifact "

@@ -178,11 +178,14 @@ def build_inventory_sql(tags):
     CASE WHEN feat.online_enabled = 1 THEN 'Online' ELSE 'Offline' END AS availability,
     feat.fg_kind,
     fs.name AS feature_store_name,
+    -- The owning project, so every chart on this dashboard can be sliced by it.
+    p.projectname AS project_name,
     {tag_cols}
 FROM (
 {feat}
 ) feat
 LEFT JOIN {SCHEMA}.feature_store fs ON fs.id = feat.feature_store_id
+LEFT JOIN {SCHEMA}.project p ON p.id = fs.project_id
 {tag_join}"""
 
 
@@ -268,6 +271,11 @@ def build_json_metadata(ds_id, excluded):
                           multi=True, excluded=excluded),
             # Bonus: filter by feature kind.
             native_filter("fgkind", "Feature group kind", ds_id, "fg_kind",
+                          multi=True, excluded=excluded),
+            # Slice the whole dashboard by project. Same exclusions as the others: the usage
+            # and sdlc datasets do not carry the column, and a filter over a column a chart
+            # cannot see makes that chart error rather than ignore it.
+            native_filter("project", "Project", ds_id, "project_name",
                           multi=True, excluded=excluded),
         ],
         "cross_filters_enabled": False,

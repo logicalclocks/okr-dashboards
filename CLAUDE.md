@@ -131,3 +131,18 @@ privileged MySQL account (the analytics read-only user cannot write), and it DEL
 existing history first so the result is one coherent set of journeys rather than backdated rows
 interleaved with real ones. The rows it writes carry a correctly computed event_id, so the unique
 key and the interval derivation treat them exactly like rows the backend wrote.
+
+
+Every dashboard here carries a **Project** selection box, so any chart can be sliced to one
+project or compared across several. It is a native filter built by `superset.project_filter`,
+scoped to the whole dashboard except charts whose dataset lacks the column: an unscoped filter
+over a column a chart cannot see makes that chart error rather than ignore it.
+
+The Asset Promotion Time dashboard goes further and takes `--series project_name`, which breaks
+the duration bars down by project instead of by asset kind. They answer different questions of the
+same data: asset kind says what is slow, project says who is slow.
+
+The Executive OKR dashboard deliberately has no project filter. Its charts are cluster-wide counts
+compared against targets from the `okrs` feature group, which has no project dimension, so slicing
+the actuals by project would put a per-project number next to a cluster-wide target and invite the
+comparison to be read as a shortfall.

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 SCHEMA = "hopsworks"
 ANALYTICS_CONNECTION = "hopsworks_analytics"
@@ -189,8 +189,14 @@ class Superset:
         )["id"]
         return Chart(id=chart_id, spec=spec)
 
-    def ensure_dashboard(self, title: str, charts: Sequence[Chart]) -> int:
+    def ensure_dashboard(
+        self,
+        title: str,
+        charts: Sequence[Chart],
+        filters: Sequence[dict[str, Any]] | None = None,
+    ) -> int:
         position = layout_json(charts, title)
+        metadata = dashboard_metadata(filters or [])
         dashboard_id = next(
             (
                 d["id"]
@@ -201,7 +207,8 @@ class Superset:
         )
         if dashboard_id is None:
             dashboard_id = self.api.create_dashboard(
-                dashboard_title=title, published=True, position_json=position
+                dashboard_title=title, published=True, position_json=position,
+                json_metadata=metadata,
             )["id"]
             print(f"Created dashboard id={dashboard_id}")
         else:
@@ -210,6 +217,7 @@ class Superset:
                 dashboard_title=title,
                 published=True,
                 position_json=position,
+                json_metadata=metadata,
             )
             print(f"Updated dashboard id={dashboard_id}")
         for chart in charts:
@@ -225,6 +233,7 @@ class Superset:
         statement: str,
         specs: Sequence[ChartSpec],
         host: str | None = None,
+        filters: Callable[[int], Sequence[dict[str, Any]]] | None = None,
     ) -> tuple[int, int]:
         """Preview the SQL, register the dataset, recreate the charts, lay them out."""
         print(f"\nGenerated SQL for '{dataset}':\n")
@@ -245,13 +254,70 @@ class Superset:
             charts.append(chart)
             print(f"  [{spec.viz_type}] {spec.name} -> id={chart.id}")
 
-        dashboard_id = self.ensure_dashboard(title, charts)
+        # Filters are built from the dataset id, which only exists once the dataset is registered,
+        # so the caller passes a function rather than the filters themselves.
+        dashboard_id = self.ensure_dashboard(
+            title, charts, filters(dataset_id) if filters else None
+        )
         print(f"Dashboard '{title}' ready (id={dashboard_id}).")
         if host:
             print(
                 f"Open it: {host}/hopsworks-api/superset/superset/dashboard/{dashboard_id}/"
             )
         return dataset_id, dashboard_id
+
+
+def native_filter(
+    filter_id: str,
+    name: str,
+    dataset_id: int,
+    column: str,
+    *,
+    multi: bool = True,
+    excluded: Sequence[int] = (),
+) -> dict[str, Any]:
+    """A dashboard selection box over one column.
+
+    Scoped to the whole dashboard except `excluded` chart ids, which is how a filter coexists
+    with charts whose dataset does not have the column: an unscoped filter over a column a chart
+    cannot see makes that chart error rather than ignore it.
+    """
+    return {
+        "id": f"NATIVE_FILTER-{filter_id}",
+        "name": name,
+        "filterType": "filter_select",
+        "type": "NATIVE_FILTER",
+        "targets": [{"datasetId": dataset_id, "column": {"name": column}}],
+        "controlValues": {
+            "multiSelect": multi,
+            "enableEmptyFilter": False,
+            "defaultToFirstItem": False,
+            "inverseSelection": False,
+            "searchAllOptions": False,
+        },
+        "scope": {"rootPath": ["ROOT_ID"], "excluded": list(excluded)},
+        "defaultDataMask": {"filterState": {}, "extraFormData": {}},
+        "cascadeParentIds": [],
+    }
+
+
+def project_filter(dataset_id: int, excluded: Sequence[int] = ()) -> dict[str, Any]:
+    """The one every dashboard here wants: slice by project.
+
+    Multi-select rather than single: comparing two teams' projects is as common a question as
+    looking at one, and a single-select cannot express it.
+    """
+    return native_filter("project", "Project", dataset_id, "project_name",
+                         multi=True, excluded=excluded)
+
+
+def dashboard_metadata(filters: Sequence[dict[str, Any]]) -> str:
+    return json.dumps(
+        {
+            "native_filter_configuration": list(filters),
+            "cross_filters_enabled": False,
+        }
+    )
 
 
 # --------------------------------------------------------------------------- #

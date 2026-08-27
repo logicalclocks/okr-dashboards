@@ -31,8 +31,6 @@ result caching disabled so they reflect current tags on every open.
 
 Run:  python create_tag_dataset.py
 """
-import json
-import re
 import sys
 
 import hopsworks
@@ -81,11 +79,9 @@ from superset import (  # noqa: E402  (kept next to what it replaces)
     Chart,
     Superset,
     layout_json,
+    project_filter,
     sanitize,
     sql_str,
-    simple_filter,
-    count_metric,
-    sql_metric,
 )
 
 
@@ -162,7 +158,7 @@ def ensure_dashboard(api, title, charts):
     )
 
 
-def build_dashboard(api, db_id, host, dataset_name, title, sql, specs):
+def build_dashboard(api, db_id, host, dataset_name, title, sql, specs, filters=None):
     """Preview the SQL, register the dataset, (re)create charts, build dashboard."""
     return _superset(api, db_id).build(
         dataset=dataset_name,
@@ -173,6 +169,7 @@ def build_dashboard(api, db_id, host, dataset_name, title, sql, specs):
             for n, v, p, w, h in specs
         ],
         host=host,
+        filters=filters,
     )
 
 
@@ -234,6 +231,9 @@ def build_denorm_sql(columns):
     END                                                     AS artifact_type,
     COALESCE(fg.name, fv.name, td.name)                     AS artifact_name,
     COALESCE(fg.version, fv.version, td.version)            AS artifact_version,
+    -- The project the artifact belongs to, so every chart here can be sliced by it. Reached
+    -- through the feature store, which is what actually carries the project id.
+    p.projectname                                           AS project_name,
     tv.feature_group_id                                     AS feature_group_id,
     tv.feature_view_id                                      AS feature_view_id,
     tv.training_dataset_id                                  AS training_dataset_id,
@@ -242,8 +242,12 @@ FROM {SCHEMA}.feature_store_tag_value tv
 LEFT JOIN {SCHEMA}.feature_group    fg ON fg.id = tv.feature_group_id
 LEFT JOIN {SCHEMA}.feature_view     fv ON fv.id = tv.feature_view_id
 LEFT JOIN {SCHEMA}.training_dataset td ON td.id = tv.training_dataset_id
+LEFT JOIN {SCHEMA}.feature_store    fs ON fs.id = COALESCE(fg.feature_store_id,
+                                                           fv.feature_store_id,
+                                                           td.feature_store_id)
+LEFT JOIN {SCHEMA}.project          p  ON p.id = fs.project_id
 GROUP BY
-    artifact_type, artifact_name, artifact_version,
+    artifact_type, artifact_name, artifact_version, project_name,
     tv.feature_group_id, tv.feature_view_id, tv.training_dataset_id"""
 
 
@@ -341,11 +345,16 @@ def build_breakdown_sql(tags):
             WHEN tv.training_dataset_id IS NOT NULL THEN 'TRAINING_DATASET'
         END                                                     AS artifact_type,
         COALESCE(fg.name, fv.name, td.name)                     AS artifact_name,
-        COALESCE(fg.version, fv.version, td.version)            AS artifact_version
+        COALESCE(fg.version, fv.version, td.version)            AS artifact_version,
+        p.projectname                                           AS project_name
     FROM {SCHEMA}.feature_store_tag_value tv
     LEFT JOIN {SCHEMA}.feature_group    fg ON fg.id = tv.feature_group_id
     LEFT JOIN {SCHEMA}.feature_view     fv ON fv.id = tv.feature_view_id
     LEFT JOIN {SCHEMA}.training_dataset td ON td.id = tv.training_dataset_id
+    LEFT JOIN {SCHEMA}.feature_store    fs ON fs.id = COALESCE(fg.feature_store_id,
+                                                               fv.feature_store_id,
+                                                               td.feature_store_id)
+    LEFT JOIN {SCHEMA}.project          p  ON p.id = fs.project_id
     WHERE tv.schema_id = {tag['id']} AND {val} IS NOT NULL""")
 
     if not blocks:
@@ -453,12 +462,14 @@ def main():
     print("\n========== OVERVIEW (denormalized, one row per artifact) ==========")
     columns = build_columns(tags)
     build_dashboard(api, db_id, host, DENORM_DATASET, OVERVIEW_TITLE,
-                    build_denorm_sql(columns), overview_chart_specs(columns))
+                    build_denorm_sql(columns), overview_chart_specs(columns),
+                    filters=lambda ds_id: [project_filter(ds_id)])
 
     # 2. BREAKDOWN (tall: one row per asset × tag-field value).
     print("\n========== BREAKDOWN (tall, one row per asset × value) ==========")
     build_dashboard(api, db_id, host, BREAKDOWN_DATASET, BREAKDOWN_TITLE,
-                    build_breakdown_sql(tags), breakdown_chart_specs(tags))
+                    build_breakdown_sql(tags), breakdown_chart_specs(tags),
+                    filters=lambda ds_id: [project_filter(ds_id)])
 
 
 if __name__ == "__main__":
