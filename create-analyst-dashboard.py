@@ -12,7 +12,7 @@ This MERGES the two former dashboards into one analyst-facing view:
 
   * feature_usage_dashboard.py  -> "Feature Usage & Reuse"
         feature REUSE across feature views and models, plus the count of
-        features in `sdlc`-tagged feature groups broken down by status.
+        features in lifecycle-tagged feature groups broken down by status.
 
 Everything reads the underlying `hopsworks.*` MySQL tables (which also happen
 to be mounted as feature groups in this project) through the one pre-provisioned
@@ -25,27 +25,54 @@ DATASETS
   feature_group_feature_usage      (physical) per-feature usage summary.
   feature_group_feature_usage_..._view  (physical) one row per (feature, FV).
   feature_group_feature_usage_model     (physical) one row per (feature, model).
-  sdlc_tagged_feature_counts       (virtual) one row per `sdlc`-tagged FG.
+  lifecycle_tagged_feature_counts  (virtual) one row per lifecycle-tagged FG.
+                                    The tag schema is resolved from the cluster
+                                    (--tag overrides); the chart is skipped when
+                                    the cluster has none.
 
 NATIVE FILTER SELECTION BOXES
 -----------------------------
 Three native filters (Tag, Tag value, Feature group kind) are scoped to ONLY
 the feature-group-activity charts (they read the `feature_group_inventory`
-dataset). The usage / reuse / sdlc charts are excluded from those filters
+dataset). The usage / reuse / status charts are excluded from those filters
 because their datasets don't carry the tag columns.
 
-Idempotent (list-then-create/update, replace-charts-by-name under the
-"Analyst · " prefix) with result caching disabled on the virtual datasets, so
-it reflects current state on every open. Charts are namespaced under their own
-prefix so re-running never disturbs the standalone dashboards.
+TWO VARIANTS
+------------
+The only thing that differs between them is the weekly feature-growth chart,
+and which dashboard it lands on:
 
-Run:  python analyst_dashboard.py
+  --variant stacked   (default)  "Analyst/Data Scientist Dashboard"
+        "New Features per Week (by tag value)" — every tag value is exploded
+        into its own stacked series, so the whole breakdown is on screen at once.
+
+  --variant filtered             "Analyst · Tag-Filtered Features"
+        "New Features per Week" — one bar per week, no explosion. You pick the
+        tag values from the "Tag value" selection box, which is scoped to drive
+        this chart. Empty selection shows all features.
+
+Neither is better; they answer the same question at different cardinalities.
+Above a handful of tag values the stacked chart becomes unreadable and the
+filtered one is the only usable form, which is why both exist.
+
+They were separate 450-line files, identical but for one `groupby` list, a
+title and a prefix. Each variant keeps its own dashboard title and chart-name
+prefix, so building one never disturbs the other.
+
+Idempotent (list-then-create/update, replace-charts-by-name under the variant's
+prefix) with result caching disabled on the virtual datasets, so it reflects
+current state on every open.
+
+Run:  python create-analyst-dashboard.py [--variant stacked|filtered] [--tag NAME]
 """
+import argparse
 import json
+from dataclasses import dataclass
 
 import hopsworks
 
 # Reuse the shared Superset plumbing from the tag-dashboard builder.
+from superset import resolve_lifecycle_tag
 from create_tag_dataset import (
     SCHEMA,
     build_position_json,
@@ -59,23 +86,54 @@ from create_tag_dataset import (
     sql_str,
 )
 
-TITLE = "Analyst/Data Scientist Dashboard"
-PREFIX = "Analyst · "                          # namespaces charts for idempotency
+
+@dataclass(frozen=True)
+class Variant:
+    """A dashboard this builder can produce.
+
+    `weekly_groupby` is the whole difference: `["tag_value"]` stacks a series per tag value,
+    `[]` draws one bar per week for the "Tag value" selection box to narrow. Everything else
+    here exists to keep the two dashboards from overwriting each other's charts.
+    """
+
+    title: str
+    prefix: str
+    weekly_chart: str
+    weekly_groupby: list[str]
+
+
+VARIANTS = {
+    "stacked": Variant(
+        title="Analyst/Data Scientist Dashboard",
+        prefix="Analyst · ",
+        weekly_chart="New Features per Week (by tag value)",
+        weekly_groupby=["tag_value"],
+    ),
+    "filtered": Variant(
+        title="Analyst · Tag-Filtered Features",
+        prefix="Analyst (Tag Filter) · ",
+        weekly_chart="New Features per Week",
+        weekly_groupby=[],
+    ),
+}
 
 # --- Datasets --------------------------------------------------------------- #
 INVENTORY_DATASET = "feature_group_inventory"
 T_SUMMARY = "feature_group_feature_usage"
 T_FV = "feature_group_feature_usage_feature_view"
 T_MODEL = "feature_group_feature_usage_model"
-SDLC_DATASET = "sdlc_tagged_feature_counts"
+STATUS_DATASET = "lifecycle_tagged_feature_counts"
 
-# Virtual (SQL-backed) dataset: one row per feature group that carries the
-# `sdlc` schematized tag, exposing the tag's `status` value and the number of
-# features in that feature group.
-SDLC_DATASET_SQL = f"""
+# Virtual (SQL-backed) dataset: one row per feature group carrying the lifecycle
+# tag, exposing the tag's `status` value and the number of features in that feature
+# group. The tag name is resolved against the cluster rather than hardcoded: this
+# used to read 'sdlc', which exists on no cluster this repo currently targets, so the
+# chart rendered empty everywhere with nothing to say why.
+def status_dataset_sql(tag_name):
+    return f"""
 SELECT fg.id AS feature_group_id,
        fg.name AS feature_group_name,
-       JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS sdlc_status,
+       JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS status,
        (SELECT COUNT(*) FROM {SCHEMA}.cached_feature cf
           WHERE cf.cached_feature_group_id = fg.cached_feature_group_id
              OR cf.stream_feature_group_id = fg.stream_feature_group_id)
@@ -83,10 +141,15 @@ SELECT fg.id AS feature_group_id,
           WHERE odf.on_demand_feature_group_id = fg.on_demand_feature_group_id)
          AS n_features
 FROM {SCHEMA}.feature_store_tag_value tv
-JOIN {SCHEMA}.feature_store_tag t ON t.id = tv.schema_id AND t.name = 'sdlc'
+JOIN {SCHEMA}.feature_store_tag t ON t.id = tv.schema_id AND t.name = {sql_str(tag_name)}
 JOIN {SCHEMA}.feature_group fg ON fg.id = tv.feature_group_id
 WHERE tv.feature_group_id IS NOT NULL
 """.strip()
+
+
+# Charts this builder used to create under a hardcoded tag name. Deleted on every run so
+# renaming the chart does not leave the old one behind in Superset.
+RETIRED_CHARTS = ["Features in sdlc-tagged feature groups by status"]
 
 
 # --------------------------------------------------------------------------- #
@@ -190,11 +253,14 @@ def build_inventory_sql(tags):
     CASE WHEN feat.online_enabled = 1 THEN 'Online' ELSE 'Offline' END AS availability,
     feat.fg_kind,
     fs.name AS feature_store_name,
+    -- The owning project, so every chart on this dashboard can be sliced by it.
+    p.projectname AS project_name,
     {tag_cols}
 FROM (
 {feat}
 ) feat
 LEFT JOIN {SCHEMA}.feature_store fs ON fs.id = feat.feature_store_id
+LEFT JOIN {SCHEMA}.project p ON p.id = fs.project_id
 {tag_join}"""
 
 
@@ -260,7 +326,7 @@ def native_filter(fid, name, ds_id, column, multi, excluded, default_first=False
             "defaultToFirstItem": default_first, "inverseSelection": False,
             "searchAllOptions": False,
         },
-        # excluded: chart ids whose datasets lack the tag columns (usage/sdlc).
+        # excluded: chart ids whose datasets lack the tag columns (usage/status).
         "scope": {"rootPath": ["ROOT_ID"], "excluded": excluded},
         "defaultDataMask": {"filterState": {}, "extraFormData": {}},
         "cascadeParentIds": [],
@@ -273,11 +339,17 @@ def build_json_metadata(ds_id, excluded):
             # Single-select: pick the tag dimension to group/slice by.
             native_filter("tagfield", "Tag", ds_id, "tag_field",
                           multi=False, excluded=excluded, default_first=False),
-            # Multi-select: narrow to specific tag values.
+            # Multi-select: narrow to specific tag values. Under --variant filtered this
+            # is what drives the weekly chart, which carries no breakdown of its own.
             native_filter("tagvalue", "Tag value", ds_id, "tag_value",
                           multi=True, excluded=excluded),
             # Bonus: filter by feature kind.
             native_filter("fgkind", "Feature group kind", ds_id, "fg_kind",
+                          multi=True, excluded=excluded),
+            # Slice the whole dashboard by project. Same exclusions as the others: the usage
+            # and status datasets do not carry the column, and a filter over a column a chart
+            # cannot see makes that chart error rather than ignore it.
+            native_filter("project", "Project", ds_id, "project_name",
                           multi=True, excluded=excluded),
         ],
         "cross_filters_enabled": False,
@@ -305,6 +377,24 @@ def ensure_dashboard(api, title, charts, json_metadata):
 
 # --------------------------------------------------------------------------- #
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser.add_argument(
+        "--variant",
+        default="stacked",
+        choices=sorted(VARIANTS),
+        help="how the weekly feature-growth chart breaks down, and which dashboard it "
+             "lands on: 'stacked' explodes a series per tag value, 'filtered' draws one "
+             "bar per week for the Tag value selection box to narrow",
+    )
+    parser.add_argument(
+        "--tag",
+        help="lifecycle tag schema for the status chart; resolved from the cluster when "
+             "omitted (see superset.LIFECYCLE_TAG_ORDER)",
+    )
+    args = parser.parse_args()
+    variant = VARIANTS[args.variant]
+    print(f"Building {variant.title!r} (--variant {args.variant})")
+
     project = hopsworks.login()
     api = project.get_superset_api()
 
@@ -328,16 +418,31 @@ def main():
     ds_summary = ensure_physical_dataset(api, db_id, T_SUMMARY)
     ds_fv = ensure_physical_dataset(api, db_id, T_FV)
     ds_model = ensure_physical_dataset(api, db_id, T_MODEL)
-    ds_sdlc = ensure_dataset(api, db_id, SDLC_DATASET, SDLC_DATASET_SQL)
-    print(f"Usage datasets ready: summary={ds_summary} fv={ds_fv} "
-          f"model={ds_model} sdlc={ds_sdlc}\n")
+    status_tag = resolve_lifecycle_tag(lambda sql: run_sql(api, db_id, sql), args.tag)
+    if status_tag:
+        ds_status = ensure_dataset(api, db_id, STATUS_DATASET,
+                                   status_dataset_sql(status_tag))
+        print(f"Lifecycle tag: {status_tag!r} (dataset {STATUS_DATASET} id={ds_status})")
+    else:
+        # No lifecycle tag on this cluster. The chart is dropped rather than built over a
+        # join that matches nothing, which is what an empty chart with no explanation is.
+        ds_status = None
+        print("No lifecycle tag schema on this cluster; the status chart is skipped. "
+              "Run mount_hopsworks_db.py to create 'asset_lifecycle'.")
+    print(f"Usage datasets ready: summary={ds_summary} fv={ds_fv} model={ds_model}\n")
+
+    for retired in RETIRED_CHARTS:
+        for chart in list_all(api, "chart"):
+            if chart.get("slice_name") == f"{variant.prefix}{retired}":
+                api.delete_chart(chart["id"])
+                print(f"Deleted retired chart {chart['slice_name']!r}")
 
     # --- Charts ------------------------------------------------------------- #
     charts = []           # ordered list of {id, name, width, height} for layout
     inventory_cids = []   # chart ids the tag/kind native filters should target
 
     def add(slice_name, viz_type, ds_id, params, width, height, inventory=False):
-        full_name = f"{PREFIX}{slice_name}"
+        full_name = f"{variant.prefix}{slice_name}"
         cid = replace_chart(api, full_name, viz_type, ds_id,
                             {**params, "viz_type": viz_type})
         charts.append({"id": cid, "name": full_name, "width": width, "height": height})
@@ -355,8 +460,11 @@ def main():
     add("Total Feature Groups", "big_number_total", ds_inv,
         {"metric": FG_METRIC, "adhoc_filters": [], "y_axis_format": "SMART_NUMBER",
          "subheader": "feature groups in the feature store"}, 6, 30, inventory=True)
-    add("New Features per Week (by tag value)", "echarts_timeseries_bar", ds_inv,
-        weekly_bar(FEATURES_METRIC, ["tag_value"]), 12, 52, inventory=True)
+    # The variant's whole reason for existing. `stacked` puts a series per tag value on
+    # screen at once; `filtered` draws one bar per week and lets the Tag value selection
+    # box narrow it, which is the only readable form once there are more than a handful.
+    add(variant.weekly_chart, "echarts_timeseries_bar", ds_inv,
+        weekly_bar(FEATURES_METRIC, variant.weekly_groupby), 12, 52, inventory=True)
     add("New Feature Groups per Week", "echarts_timeseries_bar", ds_inv,
         weekly_bar(FG_METRIC, []), 6, 50, inventory=True)
     add("New Features per Week (by kind)", "echarts_timeseries_bar", ds_inv,
@@ -376,7 +484,7 @@ def main():
          "adhoc_filters": [], "row_limit": 2000, "order_by_cols": [],
          "table_timestamp_format": "smart_date"}, 12, 60, inventory=True)
 
-    # ===== Feature Usage & Reuse (physical usage tables + sdlc) ============= #
+    # ===== Feature Usage & Reuse (physical usage tables + lifecycle tag) ==== #
     add("Feature→FeatureView usages", "big_number_total", ds_fv,
         {"metric": COUNT, "adhoc_filters": [], "y_axis_format": "SMART_NUMBER",
          "subheader": "feature uses across all feature views"}, 6, 30)
@@ -396,19 +504,21 @@ def main():
                             "sqlExpression": "models_count > 0", "clause": "WHERE"}],
          "x_axis_title": "# models using a feature", "y_axis_title": "# features",
          "x_axis_format": "SMART_NUMBER", "y_axis_format": "SMART_NUMBER"}, 12, 55)
-    add("Features in sdlc-tagged feature groups by status", "echarts_timeseries_bar",
-        ds_sdlc, {**bar("sdlc_status", SUM_FEATURES, limit=25),
-                  "x_axis_title": "sdlc status", "y_axis_title": "# features"}, 12, 55)
+    if ds_status is not None:
+        add(f"Features by {status_tag} status", "echarts_timeseries_bar",
+            ds_status, {**bar("status", SUM_FEATURES, limit=25),
+                        "x_axis_title": f"{status_tag} status",
+                        "y_axis_title": "# features"}, 12, 55)
 
     # --- Dashboard ---------------------------------------------------------- #
-    # Tag/kind filters target the inventory dataset; exclude the usage/sdlc
+    # Tag/kind filters target the inventory dataset; exclude the usage/status
     # charts (their datasets don't carry tag_field / tag_value / fg_kind).
     excluded = [c["id"] for c in charts if c["id"] not in inventory_cids]
     json_metadata = build_json_metadata(ds_inv, excluded)
 
-    dash_id = ensure_dashboard(api, TITLE, charts, json_metadata)
+    dash_id = ensure_dashboard(api, variant.title, charts, json_metadata)
     host = api._get_superset_url() if hasattr(api, "_get_superset_url") else ""
-    print(f"\nDashboard '{TITLE}' ready (id={dash_id}).")
+    print(f"\nDashboard '{variant.title}' ready (id={dash_id}).")
     print(f"Open it: {host}/hopsworks-api/superset/superset/dashboard/{dash_id}/")
 
 

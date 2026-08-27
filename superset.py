@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 SCHEMA = "hopsworks"
 ANALYTICS_CONNECTION = "hopsworks_analytics"
@@ -189,8 +189,15 @@ class Superset:
         )["id"]
         return Chart(id=chart_id, spec=spec)
 
-    def ensure_dashboard(self, title: str, charts: Sequence[Chart]) -> int:
-        position = layout_json(charts, title)
+    def ensure_dashboard(
+        self,
+        title: str,
+        charts: Sequence[Chart],
+        filters: Sequence[dict[str, Any]] | None = None,
+        note: str | None = None,
+    ) -> int:
+        position = layout_json(charts, title, note)
+        metadata = dashboard_metadata(filters or [])
         dashboard_id = next(
             (
                 d["id"]
@@ -201,7 +208,8 @@ class Superset:
         )
         if dashboard_id is None:
             dashboard_id = self.api.create_dashboard(
-                dashboard_title=title, published=True, position_json=position
+                dashboard_title=title, published=True, position_json=position,
+                json_metadata=metadata,
             )["id"]
             print(f"Created dashboard id={dashboard_id}")
         else:
@@ -210,6 +218,7 @@ class Superset:
                 dashboard_title=title,
                 published=True,
                 position_json=position,
+                json_metadata=metadata,
             )
             print(f"Updated dashboard id={dashboard_id}")
         for chart in charts:
@@ -225,6 +234,8 @@ class Superset:
         statement: str,
         specs: Sequence[ChartSpec],
         host: str | None = None,
+        filters: Callable[[int], Sequence[dict[str, Any]]] | None = None,
+        note: str | None = None,
     ) -> tuple[int, int]:
         """Preview the SQL, register the dataset, recreate the charts, lay them out."""
         print(f"\nGenerated SQL for '{dataset}':\n")
@@ -245,7 +256,11 @@ class Superset:
             charts.append(chart)
             print(f"  [{spec.viz_type}] {spec.name} -> id={chart.id}")
 
-        dashboard_id = self.ensure_dashboard(title, charts)
+        # Filters are built from the dataset id, which only exists once the dataset is registered,
+        # so the caller passes a function rather than the filters themselves.
+        dashboard_id = self.ensure_dashboard(
+            title, charts, filters(dataset_id) if filters else None, note=note
+        )
         print(f"Dashboard '{title}' ready (id={dashboard_id}).")
         if host:
             print(
@@ -254,11 +269,68 @@ class Superset:
         return dataset_id, dashboard_id
 
 
+def native_filter(
+    filter_id: str,
+    name: str,
+    dataset_id: int,
+    column: str,
+    *,
+    multi: bool = True,
+    excluded: Sequence[int] = (),
+) -> dict[str, Any]:
+    """A dashboard selection box over one column.
+
+    Scoped to the whole dashboard except `excluded` chart ids, which is how a filter coexists
+    with charts whose dataset does not have the column: an unscoped filter over a column a chart
+    cannot see makes that chart error rather than ignore it.
+    """
+    return {
+        "id": f"NATIVE_FILTER-{filter_id}",
+        "name": name,
+        "filterType": "filter_select",
+        "type": "NATIVE_FILTER",
+        "targets": [{"datasetId": dataset_id, "column": {"name": column}}],
+        "controlValues": {
+            "multiSelect": multi,
+            "enableEmptyFilter": False,
+            "defaultToFirstItem": False,
+            "inverseSelection": False,
+            "searchAllOptions": False,
+        },
+        "scope": {"rootPath": ["ROOT_ID"], "excluded": list(excluded)},
+        "defaultDataMask": {"filterState": {}, "extraFormData": {}},
+        "cascadeParentIds": [],
+    }
+
+
+def project_filter(dataset_id: int, excluded: Sequence[int] = ()) -> dict[str, Any]:
+    """The one every dashboard here wants: slice by project.
+
+    Multi-select rather than single: comparing two teams' projects is as common a question as
+    looking at one, and a single-select cannot express it.
+    """
+    return native_filter("project", "Project", dataset_id, "project_name",
+                         multi=True, excluded=excluded)
+
+
+def dashboard_metadata(filters: Sequence[dict[str, Any]]) -> str:
+    return json.dumps(
+        {
+            "native_filter_configuration": list(filters),
+            "cross_filters_enabled": False,
+        }
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Layout
 # --------------------------------------------------------------------------- #
-def layout_json(charts: Sequence[Chart], title: str) -> str:
-    """Greedily pack charts into rows of 12 columns, in Superset's v2 layout shape."""
+def layout_json(charts: Sequence[Chart], title: str, note: str | None = None) -> str:
+    """Greedily pack charts into rows of 12 columns, in Superset's v2 layout shape.
+
+    `note` is markdown placed above the first row. A dashboard whose numbers need a caveat
+    should carry the caveat, not rely on whoever reads it having read the docs.
+    """
     layout: dict[str, Any] = {
         "DASHBOARD_VERSION_KEY": "v2",
         "ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": ["GRID_ID"]},
@@ -289,6 +361,18 @@ def layout_json(charts: Sequence[Chart], title: str) -> str:
         layout["GRID_ID"]["children"].append(row_id)
 
     start_row()
+    if note:
+        node = "MARKDOWN-note"
+        layout[node] = {
+            "type": "MARKDOWN",
+            "id": node,
+            "children": [],
+            "parents": ["ROOT_ID", "GRID_ID", row_id],
+            "meta": {"width": GRID_COLUMNS, "height": 22, "code": note},
+        }
+        layout[row_id]["children"].append(node)
+        start_row()
+
     for chart in charts:
         if used + chart.width > GRID_COLUMNS:
             start_row()
@@ -412,3 +496,95 @@ def load_tags(superset: Superset) -> list[TagSchema]:
         tags.append(TagSchema(id=int(row["id"]), name=row["name"], fields=fields))
         print(f"  tag #{row['id']} {row['name']!r} -> [{', '.join(n for n, _ in fields)}]")
     return tags
+
+
+# The tag schemas a lifecycle chart can read, best first. There is no single name every
+# cluster uses: `mount_hopsworks_db` creates `asset_lifecycle`, the demo data on the
+# reference cluster carries `asset`, and older installs used `sdlc`. Hardcoding any one of
+# them is what made the analyst dashboard's status chart render empty everywhere else, with
+# no error to explain it — a tag name that does not exist is not a failure to Superset, it
+# is a join that matches nothing.
+LIFECYCLE_TAG_ORDER = ("asset_lifecycle", "asset", "sdlc", "lifecycle_status")
+
+
+def resolve_lifecycle_tag(
+    query: Callable[[str], list[dict[str, Any]]],
+    preferred: str | None = None,
+    field_name: str = "status",
+) -> str | None:
+    """The name of the lifecycle tag schema to chart, or None when the cluster has none.
+
+    `query` is anything that runs SQL and returns rows: `Superset.sql`, or a lambda over the
+    older builders' `run_sql`. Passing the callable rather than a client keeps this usable
+    from the builders that have not been ported to `Superset` yet.
+
+    An explicit `preferred` name is honoured if it exists and refused if it does not, because
+    a caller that named a tag wants that tag: silently charting a different one is worse than
+    saying the name was wrong. Without one, the first candidate that exists *and* carries the
+    field being charted wins — a schema without the field would produce the same empty chart
+    the fallback exists to avoid.
+    """
+    present = {
+        str(row["name"]): row.get("tag_schema") or ""
+        for row in query("SELECT name, tag_schema FROM feature_store_tag")
+    }
+
+    def carries_field(name: str) -> bool:
+        try:
+            properties = (json.loads(present[name]) or {}).get("properties") or {}
+        except (TypeError, ValueError):
+            return False
+        return field_name in properties
+
+    if preferred:
+        if preferred not in present:
+            raise SystemExit(
+                f"No tag schema named {preferred!r} on this cluster. "
+                f"Present: {', '.join(sorted(present)) or '(none)'}"
+            )
+        if not carries_field(preferred):
+            print(f"  ! tag {preferred!r} has no {field_name!r} field; charting it anyway")
+        return preferred
+
+    for candidate in LIFECYCLE_TAG_ORDER:
+        if candidate in present and carries_field(candidate):
+            return candidate
+    return None
+
+
+# Where a schema declares no enum. Only a fallback: a lifecycle chart built over the wrong
+# stage list is the same failure as one built over the wrong tag name, and just as quiet.
+DEFAULT_STATUS_VALUES = ("dev", "qa", "uat", "prod")
+
+# Not a lifecycle stage. An asset does not progress *to* deprecated on its way anywhere, so
+# it is excluded from funnels and promotion journeys while staying a legitimate tag value.
+TERMINAL_STATUS = "deprecated"
+
+
+def lifecycle_status_values(
+    query: Callable[[str], list[dict[str, Any]]],
+    tag_name: str,
+    field_name: str = "status",
+) -> list[str]:
+    """The status values a tag schema declares, in the order it declares them.
+
+    Declaration order is lifecycle order by convention here, and it is the only ordering
+    available: the schema records an enum, not a progression. Reading it beats a hardcoded
+    list because the two schemas in the wild disagree -- `asset` has rnd, `asset_lifecycle`
+    has dev -- and a chart built over the wrong one silently omits every asset in the stage
+    it does not know about, which reads as an empty stage rather than a missing one.
+    """
+    rows = query(
+        "SELECT tag_schema FROM feature_store_tag WHERE name = " + sql_str(tag_name)
+    )
+    if rows:
+        try:
+            properties = (json.loads(rows[0]["tag_schema"]) or {}).get("properties") or {}
+            values = (properties.get(field_name) or {}).get("enum")
+            if values:
+                return [str(v) for v in values]
+        except (TypeError, ValueError):
+            pass
+    print(f"  ! tag {tag_name!r} declares no {field_name!r} enum; "
+          f"falling back to {', '.join(DEFAULT_STATUS_VALUES)}")
+    return list(DEFAULT_STATUS_VALUES)

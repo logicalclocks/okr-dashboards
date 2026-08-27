@@ -24,7 +24,6 @@ Run:  python create_tag_history_dashboard.py
 """
 from __future__ import annotations
 
-import json
 
 import hopsworks
 
@@ -33,9 +32,7 @@ from superset import (
     ChartSpec,
     Superset,
     categorical_bar,
-    count_metric,
-    simple_filter,
-    sql_metric,
+    project_filter,
 )
 
 INTERVALS_DATASET = "tag_history_intervals"
@@ -126,7 +123,7 @@ def _filter(col, op, val):
     }
 
 
-def chart_specs(dataset_id):
+def chart_specs():
     """The four questions the event log exists to answer, and nothing else.
 
     Each one is impossible against feature_store_tag_value alone, which knows only the current
@@ -139,26 +136,24 @@ def chart_specs(dataset_id):
         # How long does something sit in each state before moving on? Completed intervals only:
         # including open ones would mix "spent 3 days in qa then moved" with "has been in qa for 3
         # days so far", and drag every average toward whatever is in flight right now.
-        {
-            "name": "Average days in each state",
-            "viz_type": "echarts_timeseries_bar",
-            "width": 6,
-            "height": 50,
-            "params": categorical_bar(
+        ChartSpec(
+            name="Average days in each state",
+            viz_type="echarts_timeseries_bar",
+            width=6,
+            params=categorical_bar(
                 x_axis="tag_value",
                 series="tag_name",
                 metrics=[_adhoc_avg_days()],
                 adhoc_filters=[completed],
                 y_axis_format=",.1f",
             ),
-        },
+        ),
         # Is it getting slower? Same measure over time, by when the state was entered.
-        {
-            "name": "Time in state, by week entered",
-            "viz_type": "echarts_timeseries_line",
-            "width": 6,
-            "height": 50,
-            "params": {
+        ChartSpec(
+            name="Time in state, by week entered",
+            viz_type="echarts_timeseries_line",
+            width=6,
+            params={
                 "viz_type": "echarts_timeseries_line",
                 "x_axis": "added_on",
                 "time_grain_sqla": "P1W",
@@ -168,28 +163,27 @@ def chart_specs(dataset_id):
                 "row_limit": 1000,
                 "y_axis_format": ",.1f",
             },
-        },
+        ),
         # Where is everything now. The one chart the live tag could also answer, kept because a
         # lifecycle dashboard is unreadable without the denominator.
-        {
-            "name": "Artifacts currently in each state",
-            "viz_type": "echarts_timeseries_bar",
-            "width": 6,
-            "height": 50,
-            "params": categorical_bar(
+        ChartSpec(
+            name="Artifacts currently in each state",
+            viz_type="echarts_timeseries_bar",
+            width=6,
+            params=categorical_bar(
                 x_axis="tag_value",
                 series="artifact_type",
                 metrics=[_adhoc_count("artifacts")],
                 adhoc_filters=[current],
             ),
-        },
+        ),
         # What is stuck. Open intervals, longest first: the actionable end of the dashboard.
-        {
-            "name": "Longest running current states",
-            "viz_type": "table",
-            "width": 12,
-            "height": 60,
-            "params": {
+        ChartSpec(
+            name="Longest running current states",
+            viz_type="table",
+            width=12,
+            height=60,
+            params={
                 "viz_type": "table",
                 "query_mode": "raw",
                 "all_columns": [
@@ -206,21 +200,19 @@ def chart_specs(dataset_id):
                 "adhoc_filters": [current],
                 "row_limit": 100,
             },
-        },
+        ),
     ]
 
 
 def main():
     project = hopsworks.login()
-    api = project.get_superset_api()
-
-    db_id, db_name = find_mysql_db_id(api)
-    print(f"hopsworks_analytics connection: id={db_id} ({db_name})\n")
+    superset = Superset.connect(project.get_superset_api())
+    print(f"hopsworks_analytics connection: id={superset.database_id} "
+          f"({superset.database_name})\n")
 
     # Fail early and legibly. An empty history almost always means no tag schema has `archive`
     # turned on, not that the SQL is wrong, and a dashboard of empty charts does not say so.
-    rows = run_sql(api, db_id, f"SELECT COUNT(*) AS n FROM {SCHEMA}.tag_history")
-    total = int(list(rows[0].values())[0]) if rows else 0
+    total = int(superset.scalar(f"SELECT COUNT(*) FROM {SCHEMA}.tag_history") or 0)
     print(f"tag_history holds {total} event(s).")
     if total == 0:
         print(
@@ -229,34 +221,14 @@ def main():
             "attachments are backfilled at their attach time."
         )
 
-    print(f"\nGenerated SQL for '{INTERVALS_DATASET}':\n")
-    print(INTERVALS_SQL)
-
-    preview = run_sql(api, db_id, f"SELECT * FROM (\n{INTERVALS_SQL}\n) _p LIMIT 5")
-    print(f"\nPreview returned {len(preview)} row(s). Sample:")
-    for row in preview:
-        print("  ", json.dumps(row, default=str))
-
-    ds_id = ensure_dataset(api, db_id, INTERVALS_DATASET, INTERVALS_SQL)
-    print(f"Dataset '{INTERVALS_DATASET}' ready (id={ds_id}).")
-
-    charts = []
-    for spec in chart_specs(ds_id):
-        chart_id = replace_chart(
-            api, spec["name"], spec["viz_type"], ds_id, spec["params"]
-        )
-        charts.append(
-            {
-                "id": chart_id,
-                "name": spec["name"],
-                "width": spec["width"],
-                "height": spec["height"],
-            }
-        )
-        print(f"  chart '{spec['name']}' ready (id={chart_id}).")
-
-    dash_id = ensure_dashboard(api, DASHBOARD_TITLE, charts)
-    print(f"\n'{DASHBOARD_TITLE}' dashboard ready (id={dash_id}).")
+    superset.build(
+        dataset=INTERVALS_DATASET,
+        title=DASHBOARD_TITLE,
+        statement=INTERVALS_SQL,
+        specs=chart_specs(),
+        # Every chart reads the intervals dataset, which carries project_name.
+        filters=lambda dataset_id: [project_filter(dataset_id)],
+    )
 
 
 if __name__ == "__main__":
