@@ -93,11 +93,14 @@ INFER_BACKOFF = 3  # seconds; multiplied by attempt number (3s, 6s, 9s, ...)
 # The tables to mount (names concatenated, no separators).
 #
 # account_audit and userlogins are deliberately absent: they hold IPs, user agents and login outcomes, and the
-# read-only database user is not granted them. Requesting them anyway did no harm (the grant refused, and the
+# read-only database user is not granted them. alert_receiver and trino_queries were removed for the same reason
+# and a sharper one: mounting a table samples its rows through infer_metadata, which sends them to the configured
+# model provider, and alert_receiver.config is the raw notification config (API keys, webhook URLs, routing keys)
+# while trino_queries holds query text, plans and the principal that ran them. Neither is read by any dashboard. Requesting them anyway did no harm (the grant refused, and the
 # script skips a table it cannot read) but it left this list asking for more than policy allows, so a later
 # widening of the grants would have mounted them silently and fed sample rows to the configured model provider.
 REQUESTED_BLOB = (
-    "activityalert_receivercached_featurecached_feature_extra_constraints"
+    "activitycached_featurecached_feature_extra_constraints"
     "cached_feature_groupdata_sourcedatasetdataset_requestdataset_shared_withembedding"
     "embedding_featureenvironmentenvironment_historyenvironment_python_librariesexecutions"
     "expectationexpectation_suitefeature_descriptive_statisticsfeature_groupfeature_group_alert"
@@ -113,7 +116,7 @@ REQUESTED_BLOB = (
     "model_linkmodel_versionon_demand_featureon_demand_feature_groupon_demand_optionproject"
     "project_teamservingserving_depl_componentserving_deploymentserving_keyserving_model_artifact"
     "serving_remote_accessshared_featureshared_feature_groupshared_feature_storestream_feature_group"
-    "training_datasettransformation_functiontriggered_alerttrino_queriesvalidation_result"
+    "training_datasettransformation_functiontriggered_alertvalidation_result"
     # The tag surface. tag_history is the attachment history the lifecycle dashboards read; the
     # other three are tag VALUE tables that predate this list's last revision and were never
     # granted, so model, deployment and job tags were invisible to every dashboard.
