@@ -34,7 +34,7 @@ import hashlib
 import random
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 SEPARATOR = ""
 TAG = "asset_lifecycle"
@@ -113,7 +113,10 @@ def journey(rng: random.Random, asset, now: datetime) -> list[Event]:
 
 def statements(assets, seed: int) -> list[str]:
     rng = random.Random(seed)
-    now = datetime.now()
+    # UTC, because event_time is UTC wall-clock (see the V100 migration) and event_id hashes the
+    # epoch millisecond. A naive datetime.now() would seed rows offset from every real event the
+    # backend writes, and read back as a dwell time wrong by the host's UTC offset.
+    now = datetime.now(timezone.utc)
     out = [
         f"DELETE FROM hopsworks.tag_history WHERE tag_name = {sql_str(TAG)};",
     ]

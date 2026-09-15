@@ -70,7 +70,11 @@ SELECT
     e.tag_value,
     e.added_on,
     e.removed_at,
-    TIMESTAMPDIFF(SECOND, e.added_on, COALESCE(e.removed_at, NOW())) AS dwell_seconds,
+    -- UTC_TIMESTAMP(), not NOW(): tag_history.event_time is written as UTC wall-clock (see the
+    -- V100 migration), while NOW() follows the database session's zone. On any cluster whose
+    -- session zone is not UTC the two differ by the offset, which lands as a constant error in
+    -- every open interval's dwell time, and a DST shift moves it mid-series.
+    TIMESTAMPDIFF(SECOND, e.added_on, COALESCE(e.removed_at, UTC_TIMESTAMP())) AS dwell_seconds,
     CASE WHEN e.removed_at IS NULL THEN 1 ELSE 0 END AS is_current
 FROM (
     SELECT

@@ -72,7 +72,8 @@ SELECT
     e.tag_value AS stage,
     e.added_on,
     e.removed_at,
-    TIMESTAMPDIFF(SECOND, e.added_on, COALESCE(e.removed_at, NOW())) AS dwell_seconds,
+    -- UTC_TIMESTAMP(), not NOW(): event_time is UTC wall-clock, NOW() is the session's zone.
+    TIMESTAMPDIFF(SECOND, e.added_on, COALESCE(e.removed_at, UTC_TIMESTAMP())) AS dwell_seconds,
     CASE WHEN e.removed_at IS NULL THEN 1 ELSE 0 END AS is_current
 FROM (
     SELECT
