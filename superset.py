@@ -75,11 +75,21 @@ class Superset:
 
     @classmethod
     def connect(cls, api: Any) -> Superset:
-        """Resolve the analytics connection, which the backend names
-        ``<connector>__<superset user>``.
+        """Resolve the analytics connection.
 
-        Matching on the mysql backend alone is not enough: a project with an
-        online feature store has a MySQL connection too, and picking the first
+        The backend provisions one shared connection named exactly
+        ``hopsworks_analytics``, granted to every cluster admin through a role.
+        Dashboards built on it are therefore queryable by every admin, which
+        they were not when each admin had their own connection.
+
+        The prefix match is the fallback for a cluster that still carries the
+        per-user connections (``<connector>__<superset user>``) from before that
+        change. It is second, not first, because both exist during an upgrade
+        and binding a dataset to somebody's personal connection is exactly the
+        outcome the shared one exists to avoid.
+
+        Matching on the mysql backend alone is not enough either: a project with
+        an online feature store has a MySQL connection too, and picking the first
         match silently points every chart at the wrong database.
         """
         mysql = [
@@ -88,11 +98,14 @@ class Superset:
             if (db.get("backend") or "").lower() == "mysql"
         ]
         for db in mysql:
+            if (db.get("database_name") or "") == ANALYTICS_CONNECTION:
+                return cls(api, db["id"], db["database_name"])
+        for db in mysql:
             name = db.get("database_name") or ""
             if name.startswith(ANALYTICS_CONNECTION):
                 return cls(api, db["id"], name)
         raise RuntimeError(
-            f"No Superset connection named {ANALYTICS_CONNECTION}* found. "
+            f"No Superset connection named {ANALYTICS_CONNECTION} found. "
             f"MySQL connections present: {[db.get('database_name') for db in mysql]}"
         )
 
