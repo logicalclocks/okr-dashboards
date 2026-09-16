@@ -148,7 +148,11 @@ def chart_specs(stages: list[str], series: str) -> list[ChartSpec]:
     """
     mean_days = sql_metric("AVG(days)", "avg days")
     max_days = sql_metric("MAX(days)", "max days")
-    assets = sql_metric("COUNT(DISTINCT artifact_id)", "assets")
+    # Composite, because artifact_id is only unique within an artifact_type: the ids come from
+    # separate tables, so a feature group and a feature view that both happen to be id 42 are two
+    # assets. Counting the id alone collapsed them into one, and only in the project series, where
+    # different kinds share a bar.
+    assets = sql_metric("COUNT(DISTINCT artifact_type, artifact_id)", "assets")
     end_to_end = f"{stages[0]} -> {stages[-1]}"
     by = f" by {series.replace('_', ' ')}"
 

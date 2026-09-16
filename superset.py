@@ -33,6 +33,39 @@ GRID_COLUMNS = 12
 PAGE_SIZE = 100
 
 
+def resolve_analytics_database(api: Any) -> tuple[int, str]:
+    """The analytics connection: ``(id, name)``.
+
+    Exact match on the shared connection first, prefix match second. The backend
+    provisions one connection named exactly ``hopsworks_analytics`` and grants it
+    through a role, but a cluster upgrading from the per-user model still carries
+    ``hopsworks_analytics__<superset user>`` connections alongside it. A prefix
+    match alone therefore picks whichever came back first, which during an upgrade
+    is routinely somebody's personal connection: the dashboards built on it are
+    then unqueryable by every other admin, and retiring that admin's connection
+    breaks them.
+
+    Matching on the mysql backend alone is not enough either: a project with an
+    online feature store has a MySQL connection too.
+    """
+    mysql = [
+        db
+        for db in api.list_databases()["result"]
+        if (db.get("backend") or "").lower() == "mysql"
+    ]
+    for db in mysql:
+        if (db.get("database_name") or "") == ANALYTICS_CONNECTION:
+            return db["id"], db["database_name"]
+    for db in mysql:
+        name = db.get("database_name") or ""
+        if name.startswith(ANALYTICS_CONNECTION):
+            return db["id"], name
+    raise RuntimeError(
+        f"No Superset connection named {ANALYTICS_CONNECTION} found. "
+        f"MySQL connections present: {[db.get('database_name') for db in mysql]}"
+    )
+
+
 @dataclass(frozen=True)
 class ChartSpec:
     """One chart, and how much of the 12-column grid it wants.
@@ -154,24 +187,58 @@ class Superset:
 
     # -- datasets ----------------------------------------------------------- #
 
+    @staticmethod
+    def _database_of(dataset: dict) -> int | None:
+        """The id of the connection a listed dataset is bound to (``database.id``)."""
+        return (dataset.get("database") or {}).get("id")
+
     def ensure_dataset(self, name: str, statement: str) -> int:
         """Register or update a virtual dataset, and make sure it reflects the SQL.
 
         Creating fails outright when ``(schema, table_name)`` already exists, so
         this looks first rather than catching.
+
+        A dataset already bound to this connection is updated in place. One bound
+        to a *different* connection is re-pointed at this one, keeping its id so
+        every chart built on it survives. That is the upgrade path off the
+        per-user connections: before, the lookup ignored the database entirely
+        and updated only the SQL, so rebuilding left every dashboard attached to
+        whichever admin first built it. Other admins could not query it, and
+        retiring that admin's connection broke it outright.
+
+        Two datasets under the same name on different connections is not a case
+        this can resolve: picking one would silently orphan the charts on the
+        other. It stops instead.
         """
+        candidates = [
+            ds
+            for ds in self._each("dataset")
+            if ds.get("table_name") == name and ds.get("schema") == SCHEMA
+        ]
         existing = next(
-            (
-                ds
-                for ds in self._each("dataset")
-                if ds.get("table_name") == name and ds.get("schema") == SCHEMA
-            ),
-            None,
+            (ds for ds in candidates if self._database_of(ds) == self.database_id), None
         )
+        strays = [ds for ds in candidates if self._database_of(ds) != self.database_id]
+        if existing is None and len(strays) > 1:
+            raise RuntimeError(
+                f"Dataset '{name}' exists on {len(strays)} connections "
+                f"({[self._database_of(d) for d in strays]}); refusing to guess which one the "
+                f"dashboards use. Delete the unused ones and re-run."
+            )
+        if existing is None and len(strays) == 1:
+            existing = strays[0]
+            self.api.update_dataset(
+                existing["id"], database_id=self.database_id, sql=statement
+            )
+            print(
+                f"Migrated dataset id={existing['id']} from connection "
+                f"{self._database_of(existing)} to the shared connection {self.database_id}"
+            )
+        elif existing:
+            self.api.update_dataset(existing["id"], sql=statement)
+            print(f"Updated existing dataset id={existing['id']}")
         if existing:
             dataset_id = existing["id"]
-            self.api.update_dataset(dataset_id, sql=statement)
-            print(f"Updated existing dataset id={dataset_id}")
         else:
             dataset_id = self.api.create_dataset(
                 database_id=self.database_id,
@@ -182,9 +249,14 @@ class Superset:
             print(f"Created dataset id={dataset_id}")
 
         self.api._request("PUT", f"/api/v1/dataset/{dataset_id}/refresh")
-        self.api.update_dataset(dataset_id, cache_timeout=0)
+        # -1 is Superset's CACHE_DISABLED_TIMEOUT (superset/constants.py): the only value
+        # that bypasses the cache. 0 does not disable caching; in Flask-Caching a timeout of
+        # 0 means never expire, so these datasets were served from a permanent cache while
+        # reporting themselves as uncached. Live counts and elapsed dwell times went stale
+        # indefinitely.
+        self.api.update_dataset(dataset_id, cache_timeout=-1)
         columns = self.api.get_dataset(dataset_id).get("result", {}).get("columns", [])
-        print(f"  synced {len(columns)} columns; cache disabled (cache_timeout=0)")
+        print(f"  synced {len(columns)} columns; cache disabled (cache_timeout=-1)")
         return dataset_id
 
     # -- charts and dashboards ---------------------------------------------- #

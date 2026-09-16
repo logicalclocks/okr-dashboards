@@ -24,6 +24,8 @@ Run:  python create_jobs_dashboard.py
 """
 import json
 
+from superset import resolve_analytics_database
+
 import hopsworks
 
 SCHEMA = "hopsworks"
@@ -76,20 +78,13 @@ ANALYTICS_CONNECTION = "hopsworks_analytics"
 
 
 def find_mysql_db_id(api):
-    """The analytics connection, which the backend names '<connector>__<superset user>'.
+    """The analytics connection, resolved the same way every other builder resolves it.
 
-    Selecting on the mysql backend alone is not enough: a project with the online feature store also has a
-    MySQL connection, so the first match can silently be the wrong database and every chart then reads it.
+    This had its own prefix-only copy of the lookup, which preferred whichever connection came back
+    first. On a cluster still carrying the per-user connections that is routinely somebody's personal
+    one, so the shared connection existed and these dashboards were built somewhere else anyway.
     """
-    mysql_dbs = [db for db in api.list_databases()["result"]
-                 if (db.get("backend") or "").lower() == "mysql"]
-    for db in mysql_dbs:
-        if (db.get("database_name") or "").startswith(ANALYTICS_CONNECTION):
-            return db["id"], db.get("database_name")
-    raise RuntimeError(
-        f"No Superset connection named {ANALYTICS_CONNECTION}* found. "
-        f"MySQL connections present: {[db.get('database_name') for db in mysql_dbs]}"
-    )
+    return resolve_analytics_database(api)
 
 
 def run_sql(api, db_id, sql):
@@ -125,9 +120,13 @@ def ensure_dataset(api, db_id, name, sql):
     # Re-introspect columns after a SQL change and disable caching so the counts
     # stay live.
     api._request("PUT", f"/api/v1/dataset/{ds_id}/refresh")
-    api.update_dataset(ds_id, cache_timeout=0)
+    # -1 is Superset's CACHE_DISABLED_TIMEOUT (superset/constants.py): the only value that
+    # bypasses the cache. 0 does not disable caching; in Flask-Caching a timeout of 0 means
+    # never expire, so these datasets were served from a permanent cache while reporting
+    # themselves as uncached. Live counts and elapsed dwell times went stale indefinitely.
+    api.update_dataset(ds_id, cache_timeout=-1)
     cols = api.get_dataset(ds_id).get("result", {}).get("columns", [])
-    print(f"  synced {len(cols)} columns; cache disabled (cache_timeout=0)")
+    print(f"  synced {len(cols)} columns; cache disabled (cache_timeout=-1)")
     return ds_id
 
 

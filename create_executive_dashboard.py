@@ -39,6 +39,7 @@ import hopsworks
 from superset import (
     TERMINAL_STATUS,
     lifecycle_status_values,
+    resolve_analytics_database,
     resolve_lifecycle_tag,
     sql_str,
 )
@@ -72,27 +73,54 @@ RETIRED_CHARTS = [
     f"{CHART_PREFIX}Pipeline Lifecycle Funnel — Feature Groups",  # -> for Features
 ]
 
+# A deployment is a model deployment when a model artifact is attached to it and
+# an agent deployment when none is. Both are rows in `serving`, so counting that
+# table alone reports every agent as a model. This is the same predicate the
+# lifecycle and promotion builders use.
+_HAS_MODEL_ARTIFACT = """EXISTS (
+            SELECT 1 FROM hopsworks.serving_deployment sd
+            JOIN hopsworks.serving_model_artifact sma ON sma.serving_depl_id = sd.id
+            WHERE sd.serving_id = s.id
+        )"""
+
 # Live MySQL actual for each OKR metric: a scalar SQL expression counting the
-# real Hopsworks metadata rows. Keyed by the metric name stored in the `okrs`
-# FG. A metric with no entry here falls back to the literal 0, so an OKR can
-# carry a target without a table behind it.
+# real Hopsworks metadata rows, keyed by the canonical metric name.
 #
-# "agent deployments" is one of those: it used to count hopsworks.agent, but
-# that table was dropped by hopsworks-ee migration V82 ([HWORKS-2789], remove
-# brewer) and no longer exists in the schema, so the query failed with
-# "Table 'hopsworks.agent' doesn't exist". Adding the table to the read-only
-# grant list is not the fix — a GRANT on a table that does not exist fails too,
-# and it would fail after the REVOKE that precedes it, leaving the read-only
-# user with no SELECT grants at all. Restore an entry here only against a table
-# that exists and is in $roTables in hopsworks-helm's grants.sql.template.
+# Every name setup can write has an entry. A metric with no entry is rejected
+# rather than silently counted as zero: a target of 10 reported against a
+# literal 0 actual reads as "nothing built yet" rather than as a broken
+# dashboard, and that is the one failure an executive dashboard must not have.
+#
+# The `agent` table was dropped by hopsworks-ee migration V82 ([HWORKS-2789],
+# remove brewer), so agent deployments are counted from `serving` by the absence
+# of a model artifact rather than from a table of their own. Adding a dropped
+# table to the read-only grant list is never the fix: a GRANT on a table that
+# does not exist fails too, and it fails after the REVOKE that precedes it,
+# leaving the read-only user with no SELECT grants at all. Any entry added here
+# must name a table that exists and is in $roTables in hopsworks-helm's
+# grants.sql.template.
 ACTUAL_SQL = {
     "features": ("(SELECT COUNT(*) FROM hopsworks.cached_feature)"
                  " + (SELECT COUNT(*) FROM hopsworks.on_demand_feature)"
                  " + (SELECT COUNT(*) FROM hopsworks.embedding_feature)"),
-    "models": "(SELECT COUNT(*) FROM hopsworks.model)",
-    "model deployments": "(SELECT COUNT(*) FROM hopsworks.serving)",
+    # The target is named for feature views, the KPI chart counts feature views,
+    # so the detail actual counts them too. It counted hopsworks.model, which
+    # made the two panels disagree for the same OKR.
+    "feature views (models)": "(SELECT COUNT(*) FROM hopsworks.feature_view)",
+    "model deployments": f"(SELECT COUNT(*) FROM hopsworks.serving s WHERE {_HAS_MODEL_ARTIFACT})",
+    "agent deployments": f"(SELECT COUNT(*) FROM hopsworks.serving s WHERE NOT {_HAS_MODEL_ARTIFACT})",
     "dashboards": "(SELECT COUNT(*) FROM hopsworks.dashboard)",
     "apps": "(SELECT COUNT(*) FROM hopsworks.jobs WHERE type = 'PYTHON_APP')",
+}
+
+# Names that earlier builds wrote into the `okrs` feature group, mapped onto the
+# canonical ones. Setup has always written "feature views (models)" while the
+# builder looked up "models", so every cluster configured through okrs.sh has a
+# row under a name the builder did not resolve. Rows are not rewritten: the
+# feature group is the customer's, and a rename on read costs nothing.
+TARGET_ALIASES = {
+    "models": "feature views (models)",
+    "feature views": "feature views (models)",
 }
 
 # The `asset` tag carries one lifecycle value per feature group in
@@ -390,20 +418,13 @@ ANALYTICS_CONNECTION = "hopsworks_analytics"
 
 
 def find_mysql_db_id(api):
-    """The analytics connection, which the backend names '<connector>__<superset user>'.
+    """The analytics connection, resolved the same way every other builder resolves it.
 
-    Selecting on the mysql backend alone is not enough: a project with the online feature store also has a
-    MySQL connection, so the first match can silently be the wrong database and every chart then reads it.
+    This had its own prefix-only copy of the lookup, which preferred whichever connection came back
+    first. On a cluster still carrying the per-user connections that is routinely somebody's personal
+    one, so the shared connection existed and these dashboards were built somewhere else anyway.
     """
-    mysql_dbs = [db for db in api.list_databases()["result"]
-                 if (db.get("backend") or "").lower() == "mysql"]
-    for db in mysql_dbs:
-        if (db.get("database_name") or "").startswith(ANALYTICS_CONNECTION):
-            return db["id"], db.get("database_name")
-    raise RuntimeError(
-        f"No Superset connection named {ANALYTICS_CONNECTION}* found. "
-        f"MySQL connections present: {[db.get('database_name') for db in mysql_dbs]}"
-    )
+    return resolve_analytics_database(api)
 
 
 def run_sql(api, db_id, sql):
@@ -417,10 +438,29 @@ def run_sql(api, db_id, sql):
 
 
 def load_targets(project):
-    """Read OKR targets from the `okrs` feature group -> {metric: target}."""
+    """Read OKR targets from the `okrs` feature group -> {canonical metric: target}.
+
+    Names are resolved through TARGET_ALIASES and then checked against ACTUAL_SQL.
+    An unrecognised name stops the build instead of becoming a zero actual, which
+    is what let a configured target of 10 render as 0 with NULL attainment.
+    """
     fs = project.get_feature_store()
     df = fs.get_feature_group(OKRS_FG, version=OKRS_FG_VERSION).read()
-    targets = {str(r["target"]): int(r["value"]) for _, r in df.iterrows()}
+    targets = {}
+    unknown = []
+    for _, r in df.iterrows():
+        name = TARGET_ALIASES.get(str(r["target"]), str(r["target"]))
+        if name not in ACTUAL_SQL:
+            unknown.append(str(r["target"]))
+            continue
+        targets[name] = int(r["value"])
+    if unknown:
+        sys.exit(
+            f"Unsupported OKR target(s) in the '{OKRS_FG}' feature group: "
+            + ", ".join(sorted(set(unknown)))
+            + ".\nSupported: " + ", ".join(sorted(ACTUAL_SQL))
+            + ".\nFix the row or add the metric to ACTUAL_SQL; it cannot be counted as it stands."
+        )
     if not targets:
         sys.exit(f"No targets found in the '{OKRS_FG}' feature group")
     return targets
@@ -469,7 +509,9 @@ def build_sql(targets):
     """UNION one row per OKR: metric, embedded target, live MySQL actual."""
     rows = []
     for metric, target in targets.items():
-        actual = ACTUAL_SQL.get(metric, "0")
+        # Unconditional: load_targets rejects any name without an entry, so a
+        # KeyError here is a bug in this file rather than bad customer data.
+        actual = ACTUAL_SQL[metric]
         esc = metric.replace("'", "''")
         rows.append(f"    SELECT '{esc}' AS metric, {int(target)} AS target, "
                     f"({actual}) AS actual")
@@ -510,9 +552,13 @@ def ensure_dataset(api, db_id, name, sql):
     # Re-introspect columns (Superset does not do this on a virtual dataset's
     # SQL change) and disable result caching so the live counts stay fresh.
     api._request("PUT", f"/api/v1/dataset/{ds_id}/refresh")
-    api.update_dataset(ds_id, cache_timeout=0)
+    # -1 is Superset's CACHE_DISABLED_TIMEOUT (superset/constants.py): the only value that
+    # bypasses the cache. 0 does not disable caching; in Flask-Caching a timeout of 0 means
+    # never expire, so these datasets were served from a permanent cache while reporting
+    # themselves as uncached. Live counts and elapsed dwell times went stale indefinitely.
+    api.update_dataset(ds_id, cache_timeout=-1)
     cols = api.get_dataset(ds_id).get("result", {}).get("columns", [])
-    print(f"  synced {len(cols)} columns; cache disabled (cache_timeout=0)")
+    print(f"  synced {len(cols)} columns; cache disabled (cache_timeout=-1)")
     return ds_id
 
 
@@ -610,7 +656,7 @@ def chart_specs(targets):
     # Position 3: Production Model Progression — number of feature views tagged
     #     asset='prod', against the models OKR target. From the fv_status dataset.
     specs.append(attainment_table(
-        PROD_MODEL_CHART, "COUNT(*)", str(int(targets.get("models", 0))),
+        PROD_MODEL_CHART, "COUNT(*)", str(int(targets.get("feature views (models)", 0))),
         sql_filter("fv_status = 'prod'")))
 
     # 3c. Two separate stacked charts (kept apart so the very different target
@@ -956,10 +1002,10 @@ def main():
     feat_ds_id = ensure_dataset(api, db_id, FEATURE_STATUS_DATASET, feature_status_sql(tag))
     print(f"Dataset '{FEATURE_STATUS_DATASET}' ready (id={feat_ds_id}).")
 
-    # Stacked dataset: features (vs features target) + Feature Views (vs models
-    # target), each split by asset with a gap-to-target segment.
+    # Stacked dataset: features (vs features target) + Feature Views (vs the
+    # feature-views target), each split by asset with a gap-to-target segment.
     feat_target = int(targets.get("features", 0))
-    fv_target = int(targets.get("models", 0))
+    fv_target = int(targets.get("feature views (models)", 0))
     stack_ds_id = ensure_dataset(
         api, db_id, FEATURE_STACK_DATASET,
         build_feature_stack_sql(feat_target, fv_target, tag, status_values))
