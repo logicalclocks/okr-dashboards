@@ -24,9 +24,9 @@ Run:  python create_jobs_dashboard.py
 """
 import json
 
-from superset import resolve_analytics_database
-
 import hopsworks
+
+from superset import resolve_analytics_database
 
 SCHEMA = "hopsworks"
 DATASET_NAME = "job_runs"

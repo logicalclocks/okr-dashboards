@@ -7,7 +7,6 @@ when there was not: a run that found no duplicates dropped the feature group and
 """
 
 import pytest
-
 from conftest import load
 
 

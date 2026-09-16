@@ -71,12 +71,10 @@ from dataclasses import dataclass
 
 import hopsworks
 
-# Reuse the shared Superset plumbing from the tag-dashboard builder.
-from superset import resolve_lifecycle_tag
 from create_tag_dataset import (
     SCHEMA,
     build_position_json,
-    ensure_dataset,            # virtual SQL dataset (refresh + cache-disable)
+    ensure_dataset,  # virtual SQL dataset (refresh + cache-disable)
     find_mysql_db_id,
     json_value_expr,
     list_all,
@@ -85,6 +83,9 @@ from create_tag_dataset import (
     run_sql,
     sql_str,
 )
+
+# Reuse the shared Superset plumbing from the tag-dashboard builder.
+from superset import resolve_lifecycle_tag
 
 
 @dataclass(frozen=True)

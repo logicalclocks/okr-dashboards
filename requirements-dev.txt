@@ -3,4 +3,7 @@
 # cluster. pandas is a genuine runtime dependency of detect_duplicate_features.py.
 pandas
 pytest
-ruff
+# Pinned: ruff's default rule set widens between releases, and an unpinned install
+# turned a green lint red with findings in files the change never touched. ruff.toml
+# names the rules; this names the version that reads it the same way.
+ruff==0.15.7

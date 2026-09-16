@@ -182,6 +182,7 @@ def main() -> int:
                                    parts[3] if parts[3] != "NULL" else None))
     else:
         import os
+
         import pymysql
 
         conn = pymysql.connect(
@@ -205,6 +206,7 @@ def main() -> int:
         return 0
 
     import os
+
     import pymysql
 
     conn = pymysql.connect(

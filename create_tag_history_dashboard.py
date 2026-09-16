@@ -24,7 +24,6 @@ Run:  python create_tag_history_dashboard.py
 """
 from __future__ import annotations
 
-
 import hopsworks
 
 from superset import (

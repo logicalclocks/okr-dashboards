@@ -75,8 +75,8 @@ ANALYTICS_CONNECTION = "hopsworks_analytics"
 # importing this script. Re-exported here because three builders still import them from
 # this module, and because module-level names are the only contract those imports have.
 from superset import (  # noqa: E402  (kept next to what it replaces)
-    ChartSpec,
     Chart,
+    ChartSpec,
     Superset,
     layout_json,
     project_filter,
