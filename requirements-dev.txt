@@ -1,0 +1,6 @@
+# Test and lint dependencies. The builders themselves run inside a Hopsworks job, where the
+# hopsworks SDK is already installed; the tests stub it out so they need neither the SDK nor a
+# cluster. pandas is a genuine runtime dependency of detect_duplicate_features.py.
+pandas
+pytest
+ruff
