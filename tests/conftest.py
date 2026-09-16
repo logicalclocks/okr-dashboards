@@ -21,19 +21,38 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 
 
+# The builders do `from superset import ...`, so the repo root has to be importable, and the
+# `superset` the tests inspect has to be the same module object the builders bound. Loading a
+# script twice would give two objects, so `load` is idempotent per module name.
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+
+class _Feature:
+    """Stand-in for hsfs.feature.Feature: a (name, type) pair and nothing else."""
+
+    def __init__(self, name: str, type: str) -> None:  # noqa: A002 - mirrors hsfs
+        self.name, self.type = name, type
+
+
 def _stub(name: str) -> None:
     if name in sys.modules:
         return
     mod = types.ModuleType(name)
-    mod.__getattr__ = lambda attr: types.SimpleNamespace()  # type: ignore[attr-defined]
+    if name == "hsfs.feature":
+        mod.Feature = _Feature  # type: ignore[attr-defined]
+    else:
+        mod.__getattr__ = lambda attr: types.SimpleNamespace()  # type: ignore[attr-defined]
     sys.modules[name] = mod
 
 
 def load(script: str, stub: tuple[str, ...] = ("hopsworks",)):
-    """Import a builder script by filename, under its own module name."""
+    """Import a builder script by filename, under its own module name, once."""
     for name in stub:
         _stub(name)
     mod_name = script.replace(".py", "").replace("-", "_")
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
     spec = importlib.util.spec_from_file_location(mod_name, REPO / script)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -88,6 +107,8 @@ class FakeApi:
             return {"result": self.datasets}
         if method == "GET" and path.startswith("/api/v1/chart/?q="):
             return {"result": self.charts}
+        if method == "GET" and path.startswith("/api/v1/dashboard/?q="):
+            return {"result": []}
         return {}
 
     # -- datasets ----------------------------------------------------------
@@ -117,6 +138,13 @@ class FakeApi:
 
     def delete_chart(self, chart_id):
         self.deleted_charts.append(chart_id)
+        return {}
+
+    # -- dashboards --------------------------------------------------------
+    def create_dashboard(self, **kwargs):
+        return {"id": 4}
+
+    def update_dashboard(self, dashboard_id, **kwargs):
         return {}
 
 

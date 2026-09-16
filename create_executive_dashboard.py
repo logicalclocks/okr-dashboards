@@ -39,6 +39,8 @@ import hopsworks
 
 from superset import (
     TERMINAL_STATUS,
+    attach_charts,
+    ensure_dataset,
     lifecycle_status_values,
     resolve_analytics_database,
     resolve_lifecycle_tag,
@@ -121,13 +123,15 @@ def _deployment_actual(tag: str, with_artifact: bool) -> str:
 def actual_sql(tag: str) -> dict[str, str]:
     """Metric name -> scalar SQL counting the live rows behind it."""
     return {
-        "features": ("(SELECT COUNT(*) FROM hopsworks.cached_feature)"
-                     " + (SELECT COUNT(*) FROM hopsworks.on_demand_feature)"
-                     " + (SELECT COUNT(*) FROM hopsworks.embedding_feature)"),
-        # The target is named for feature views, the KPI chart counts feature views, so the
-        # detail actual counts them too. It counted hopsworks.model, which made the two panels
-        # disagree for the same OKR.
-        "feature views (models)": "(SELECT COUNT(*) FROM hopsworks.feature_view)",
+        # Setup asks for *production* features and feature views, and the KPI panels filter on
+        # the lifecycle tag's prod status. The detail row has to count the same population, or
+        # the two disagree on one screen: with one production view and 99 in development against
+        # a target of 10, the KPI read 10% and this row read 1000%. Both are built from the same
+        # status subqueries the KPI datasets use, so they cannot drift apart again.
+        "features": (f"(SELECT COUNT(*) FROM ({feature_status_sql(tag)}) f"
+                     " WHERE f.fg_status = 'prod')"),
+        "feature views (models)": (f"(SELECT COUNT(*) FROM ({fv_status_sql(tag)}) v"
+                                   " WHERE v.fv_status = 'prod')"),
         "model deployments": _deployment_actual(tag, True),
         "agent deployments": _deployment_actual(tag, False),
         "dashboards": "(SELECT COUNT(*) FROM hopsworks.dashboard)",
@@ -495,31 +499,65 @@ def load_targets(project):
     return targets
 
 
-def build_dup_features_counts_sql(project):
-    """feature_name -> times-suspected-as-duplicate, embedded as a literal SELECT.
+def read_duplicate_scan(project):
+    """The latest duplicate-features scan: ``(counts, scanned_at, state)``.
 
-    Read the `suspected_duplicate_features` feature group via the Hopsworks
-    Feature Query Service (reliable in-process) and embed the per-feature counts.
-    The FG's offline DELTA table is NOT reliably queryable through Superset's
-    Trino connection — Trino caches the table's split/file manifest for the
-    reused path and keeps referencing parquet files that each rewrite deletes
-    (COUNT works off delta stats, but a GROUP BY scan hits the dead file). So we
-    aggregate here at build time; re-run this builder to refresh the chart after
-    the nightly detection job updates the FG. Only features actually flagged
-    appear, so features with zero suspected duplicates are naturally excluded.
+    ``counts`` is feature_name -> times suspected. ``scanned_at`` is the ISO time the detector
+    recorded in the feature group's description, or None. ``state`` is one of ``"ok"`` (a scan
+    was read, possibly with zero findings), ``"absent"`` (the detector has never published) or
+    ``"unreadable"`` (a version exists but could not be read). The three are kept apart because
+    the dashboard used to render all of them as an empty chart, so a broken read was
+    indistinguishable from a clean bill of health.
+
+    Reads the newest version rather than a fixed one: the detector publishes each scan as a new
+    version and retires the older ones only after the new one is committed, so the newest is
+    always a complete result and an in-flight failure never removes the last good one.
     """
     fs = project.get_feature_store()
+    try:
+        versions = fs.get_feature_groups(DUP_FEATURES_FG)
+    except Exception as e:
+        print(f"  ! could not list '{DUP_FEATURES_FG}' ({e}).")
+        return {}, None, "absent"
+    if not versions:
+        return {}, None, "absent"
+    latest = max(versions, key=lambda fg: fg.version)
+    scanned_at, findings = None, None
+    for token in (latest.description or "").split():
+        if token.startswith(DUP_SCANNED_AT_PREFIX):
+            scanned_at = token[len(DUP_SCANNED_AT_PREFIX):]
+        elif token.startswith(DUP_FINDINGS_PREFIX):
+            try:
+                findings = int(token[len(DUP_FINDINGS_PREFIX):])
+            except ValueError:
+                findings = None
+    if findings == 0:
+        # A clean scan. Not read, deliberately: an empty DELTA feature group has a schema and no
+        # data files, and reading it fails with "no active delta files", which would make a clean
+        # bill of health indistinguishable from a broken read. The detector recorded the count so
+        # this does not have to guess from an error message.
+        return {}, scanned_at, "ok"
     counts = {}
     try:
-        df = fs.get_feature_group(DUP_FEATURES_FG, version=1) \
-               .select(["feature_name"]).read()
-        for name, c in df["feature_name"].value_counts().items():
-            label = "" if name is None else str(name)
-            if label:
-                counts[label] = int(c)
+        df = latest.select(["feature_name"]).read()
     except Exception as e:
-        print(f"  ! could not read '{DUP_FEATURES_FG}' ({e}); chart left empty.")
+        print(f"  ! could not read '{DUP_FEATURES_FG}' v{latest.version} ({e}).")
+        return {}, scanned_at, "unreadable"
+    for name, c in df["feature_name"].value_counts().items():
+        label = "" if name is None else str(name)
+        if label:
+            counts[label] = int(c)
+    return counts, scanned_at, "ok"
 
+
+def build_dup_features_counts_sql(counts):
+    """feature_name -> times-suspected-as-duplicate, embedded as a literal SELECT.
+
+    Embedded at build time rather than queried live: the FG's offline DELTA table is not reliably
+    queryable through Superset's Trino connection, which caches the split manifest for the reused
+    path and keeps referencing parquet files each rewrite deletes. Only features actually flagged
+    appear, so features with zero suspected duplicates are naturally excluded.
+    """
     if not counts:
         return ("SELECT CAST(NULL AS CHAR) AS feature_name, "
                 "0 AS times_suspected WHERE 1 = 0")
@@ -558,41 +596,6 @@ def build_sql(targets, tag):
 FROM (
 {union}
 ) t"""
-
-
-def ensure_dataset(api, db_id, name, sql):
-    page, existing = 0, None
-    while True:
-        j = api._request("GET", f"/api/v1/dataset/?q=(page:{page},page_size:100)")
-        batch = j.get("result", [])
-        for ds in batch:
-            if ds.get("table_name") == name and ds.get("schema") == SCHEMA:
-                existing = ds
-                break
-        if existing or len(batch) < 100:
-            break
-        page += 1
-
-    if existing:
-        ds_id = existing["id"]
-        api.update_dataset(ds_id, sql=sql)
-        print(f"Updated existing dataset id={ds_id}")
-    else:
-        ds_id = api.create_dataset(
-            database_id=db_id, table_name=name, schema=SCHEMA, sql=sql)["id"]
-        print(f"Created dataset id={ds_id}")
-
-    # Re-introspect columns (Superset does not do this on a virtual dataset's
-    # SQL change) and disable result caching so the live counts stay fresh.
-    api._request("PUT", f"/api/v1/dataset/{ds_id}/refresh")
-    # -1 is Superset's CACHE_DISABLED_TIMEOUT (superset/constants.py): the only value that
-    # bypasses the cache. 0 does not disable caching; in Flask-Caching a timeout of 0 means
-    # never expire, so these datasets were served from a permanent cache while reporting
-    # themselves as uncached. Live counts and elapsed dwell times went stale indefinitely.
-    api.update_dataset(ds_id, cache_timeout=-1)
-    cols = api.get_dataset(ds_id).get("result", {}).get("columns", [])
-    print(f"  synced {len(cols)} columns; cache disabled (cache_timeout=-1)")
-    return ds_id
 
 
 def list_all(api, resource):
@@ -665,6 +668,9 @@ DUP_FEATURES_CHART = f"{CHART_PREFIX}Suspected Duplicate Features"
 # The feature group the nightly duplicate-detection job (de)populates.
 DUP_FEATURES_FG = "suspected_duplicate_features"
 DUP_FEATURES_DATASET = "suspected_duplicate_feature_counts"
+# Token the detector writes into the feature group description; see detect_duplicate_features.
+DUP_SCANNED_AT_PREFIX = "scanned_at="
+DUP_FINDINGS_PREFIX = "findings="
 
 
 def chart_specs(targets):
@@ -1014,8 +1020,7 @@ def ensure_dashboard(api, title, charts, json_metadata=None, note=None):
     else:
         api.update_dashboard(dash_id, **kwargs)
         print(f"Updated dashboard id={dash_id}")
-    for ch in charts:
-        api.update_chart(ch["id"], dashboards=[dash_id])
+    attach_charts(api, dash_id, [ch["id"] for ch in charts])
     return dash_id
 
 
@@ -1103,8 +1108,9 @@ def main():
     print(f"Dataset '{MODEL_TTM_DATASET}' ready (id={ttm_ds_id}).")
 
     # Suspected-duplicate-feature counts, embedded from the FG (read in-process).
+    dup_counts, dup_scanned_at, dup_state = read_duplicate_scan(project)
     dup_ds_id = ensure_dataset(api, db_id, DUP_FEATURES_DATASET,
-                               build_dup_features_counts_sql(project))
+                               build_dup_features_counts_sql(dup_counts))
     print(f"Dataset '{DUP_FEATURES_DATASET}' ready (id={dup_ds_id}).")
 
     # Delete charts retired from the dashboard so they don't linger in Superset.
@@ -1165,10 +1171,21 @@ def main():
     # dashboards only. Stating when they were taken is what makes a stale number recognisable;
     # refresh_dashboards.py re-runs this builder alongside the tag datasets.
     taken = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    note = (f"**OKR targets and duplicate-feature counts are a snapshot taken {taken}.** "
+    # The scan time is the detector's, not this build's: the two are separate events and a fresh
+    # build of a month-old scan must not read as a month-old finding refreshed today.
+    if dup_state == "ok" and dup_scanned_at:
+        dup_line = f"Duplicate-feature findings come from the scan at {dup_scanned_at}."
+    elif dup_state == "ok":
+        dup_line = "Duplicate-feature findings come from the latest scan (time not recorded)."
+    elif dup_state == "absent":
+        dup_line = "**No duplicate-feature scan has been published yet**; that chart is empty."
+    else:
+        dup_line = ("**The latest duplicate-feature scan could not be read**; that chart is "
+                    "empty and does not mean there are none.")
+    note = (f"**OKR targets are a snapshot taken {taken}.** {dup_line} "
             "Every other number on this page is read live. Re-run "
-            "`refresh_dashboards.py` (or `create_executive_dashboard.py`) after changing the "
-            "`okrs` feature group or running the duplicate detector.")
+            "`refresh_dashboards.py` after changing the `okrs` feature group or running the "
+            "duplicate detector.")
     dash_id = ensure_dashboard(api, DASHBOARD_TITLE, charts, json_metadata, note=note)
     print(f"\nDashboard '{DASHBOARD_TITLE}' ready (id={dash_id}).")
     print(f"Open it: {host}/hopsworks-api/superset/superset/dashboard/{dash_id}/")

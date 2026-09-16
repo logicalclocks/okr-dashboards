@@ -66,6 +66,49 @@ def resolve_analytics_database(api: Any) -> tuple[int, str]:
     )
 
 
+def ensure_dataset(api: Any, database_id: int, name: str, statement: str) -> int:
+    """Register or update a virtual dataset on ``database_id``; see ``Superset.ensure_dataset``.
+
+    The executive and jobs builders resolve their connection themselves and used to carry their
+    own copy of this, which matched on name alone and never moved a dataset off the connection it
+    was first built on. One implementation, so the migration happens for every dashboard.
+    """
+    return Superset(api, database_id, ANALYTICS_CONNECTION).ensure_dataset(name, statement)
+
+
+def _list_all(api: Any, resource: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    page = 0
+    while True:
+        batch = api._request(
+            "GET", f"/api/v1/{resource}/?q=(page:{page},page_size:{PAGE_SIZE})"
+        ).get("result", [])
+        items.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return items
+        page += 1
+
+
+def attach_charts(api: Any, dashboard_id: int, chart_ids: Sequence[int]) -> None:
+    """Add each chart to ``dashboard_id`` without detaching it from anything else.
+
+    Superset's chart PUT takes the complete membership list, so
+    ``dashboards=[dashboard_id]`` is a replacement, not an addition: rebuilding one dashboard
+    silently removed every chart it touched from any other dashboard that reused it, even though
+    the chart id itself survived. The current memberships are read once and the destination is
+    unioned in.
+    """
+    wanted = set(chart_ids)
+    current = {
+        c["id"]: {d["id"] for d in (c.get("dashboards") or []) if "id" in d}
+        for c in _list_all(api, "chart")
+        if c.get("id") in wanted
+    }
+    for chart_id in chart_ids:
+        memberships = current.get(chart_id, set()) | {dashboard_id}
+        api.update_chart(chart_id, dashboards=sorted(memberships))
+
+
 @dataclass(frozen=True)
 class ChartSpec:
     """One chart, and how much of the 12-column grid it wants.
@@ -337,9 +380,8 @@ class Superset:
                 json_metadata=metadata,
             )
             print(f"Updated dashboard id={dashboard_id}")
-        for chart in charts:
-            # Persist the chart -> dashboard link; the layout alone does not.
-            self.api.update_chart(chart.id, dashboards=[dashboard_id])
+        # Persist the chart -> dashboard link; the layout alone does not.
+        attach_charts(self.api, dashboard_id, [chart.id for chart in charts])
         return dashboard_id
 
     def build(

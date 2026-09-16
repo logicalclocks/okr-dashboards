@@ -65,3 +65,13 @@ def test_an_unsupported_metric_is_not_silently_zero(executive):
     yet' rather than as a broken dashboard."""
     with pytest.raises(KeyError):
         executive.build_sql({"not a real metric": 1}, "asset_lifecycle")
+
+
+def test_feature_and_feature_view_actuals_count_production_only(executive):
+    """The KPI panels filter on the lifecycle tag's prod status; the detail row beside them must
+    count the same population. With one production view and 99 in development against a target
+    of 10, the KPI read 10% while this row read 1000%."""
+    sql = executive.actual_sql("asset_lifecycle")
+    for key in ("features", "feature views (models)"):
+        assert "= 'prod'" in sql[key], key
+        assert "'asset_lifecycle'" in sql[key], key

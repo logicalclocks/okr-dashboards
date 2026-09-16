@@ -65,6 +65,8 @@ Then, when `schedule_daily_tag_job` is `yes`, create a Python job to run 'refres
 
 Run 'refresh_dashboards.py', not 'create_tag_dataset.py' directly. It runs the tag datasets and then the executive dashboard, which is the set whose numbers are snapshots rather than live reads. The executive dashboard embeds its OKR targets and duplicate-feature counts as SQL literals fixed at build time, so a job that rebuilt only the tag datasets left those reporting whatever they held when the dashboard was first created, however often it ran.
 
+An installation set up before refresh_dashboards.py existed has this job pointing at create_tag_dataset.py. It will report success on every run while the executive targets never change, and the UI cannot tell the two apart because it finds the job by name. Run 'migrate_refresh_job.py' once on such an installation: it uploads the runner and its sibling scripts next to the job's current entry point, switches the entry point, and runs the job once to confirm.
+
 Name that job exactly `update-tag-dataset`. This is a contract, not a preference: the Hopsworks UI's "Refresh Dashboard Now" action looks the job up by that literal name (ANALYTICS_TAG_JOB in hopsworks-front's `src/modules/wizard/Wizard.tsx`). Any other name and the action 404s and tells the user to run Setup Analytics first, which they will already have done. The name is now slightly narrower than what the job does, and it stays as it is because the UI depends on the literal.
 
 

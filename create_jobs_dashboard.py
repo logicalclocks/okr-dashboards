@@ -26,7 +26,7 @@ import json
 
 import hopsworks
 
-from superset import resolve_analytics_database
+from superset import attach_charts, ensure_dataset, resolve_analytics_database
 
 SCHEMA = "hopsworks"
 DATASET_NAME = "job_runs"
@@ -93,41 +93,6 @@ def run_sql(api, db_id, sql):
     r = api._request("POST", "/api/v1/sqllab/execute/", json_data=body)
     cols = [c["name"] for c in r.get("columns", [])]
     return [dict(zip(cols, [row.get(c) for c in cols])) for row in r.get("data", [])]
-
-
-def ensure_dataset(api, db_id, name, sql):
-    page, existing = 0, None
-    while True:
-        j = api._request("GET", f"/api/v1/dataset/?q=(page:{page},page_size:100)")
-        batch = j.get("result", [])
-        for ds in batch:
-            if ds.get("table_name") == name and ds.get("schema") == SCHEMA:
-                existing = ds
-                break
-        if existing or len(batch) < 100:
-            break
-        page += 1
-
-    if existing:
-        ds_id = existing["id"]
-        api.update_dataset(ds_id, sql=sql)
-        print(f"Updated existing dataset id={ds_id}")
-    else:
-        ds_id = api.create_dataset(
-            database_id=db_id, table_name=name, schema=SCHEMA, sql=sql)["id"]
-        print(f"Created dataset id={ds_id}")
-
-    # Re-introspect columns after a SQL change and disable caching so the counts
-    # stay live.
-    api._request("PUT", f"/api/v1/dataset/{ds_id}/refresh")
-    # -1 is Superset's CACHE_DISABLED_TIMEOUT (superset/constants.py): the only value that
-    # bypasses the cache. 0 does not disable caching; in Flask-Caching a timeout of 0 means
-    # never expire, so these datasets were served from a permanent cache while reporting
-    # themselves as uncached. Live counts and elapsed dwell times went stale indefinitely.
-    api.update_dataset(ds_id, cache_timeout=-1)
-    cols = api.get_dataset(ds_id).get("result", {}).get("columns", [])
-    print(f"  synced {len(cols)} columns; cache disabled (cache_timeout=-1)")
-    return ds_id
 
 
 def list_all(api, resource):
@@ -330,8 +295,7 @@ def ensure_dashboard(api, title, charts, json_metadata):
         api.update_dashboard(dash_id, dashboard_title=title, published=True,
                              position_json=position_json, json_metadata=json_metadata)
         print(f"Updated dashboard id={dash_id}")
-    for ch in charts:
-        api.update_chart(ch["id"], dashboards=[dash_id])
+    attach_charts(api, dash_id, [ch["id"] for ch in charts])
     return dash_id
 
 

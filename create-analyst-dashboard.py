@@ -85,7 +85,7 @@ from create_tag_dataset import (
 )
 
 # Reuse the shared Superset plumbing from the tag-dashboard builder.
-from superset import resolve_lifecycle_tag
+from superset import attach_charts, resolve_lifecycle_tag
 
 
 @dataclass(frozen=True)
@@ -371,8 +371,7 @@ def ensure_dashboard(api, title, charts, json_metadata):
                              position_json=position_json,
                              json_metadata=json_metadata)
         print(f"Updated dashboard id={dash_id}")
-    for ch in charts:                              # persist chart -> dashboard link
-        api.update_chart(ch["id"], dashboards=[dash_id])
+    attach_charts(api, dash_id, [ch["id"] for ch in charts])
     return dash_id
 
 

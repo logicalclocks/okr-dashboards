@@ -35,13 +35,14 @@ import re
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 
 import hopsworks
 import pandas as pd
+from hsfs.feature import Feature
 
-# Feature group this pipeline (over)writes.
+# Feature group this pipeline publishes; each scan is a new version, see write_feature_group.
 FG_NAME = "suspected_duplicate_features"
-FG_VERSION = 1
 
 # Staged Claude assets (see stage_claude_assets.py): the self-contained binary in
 # HopsFS and the OAuth credentials in a PRIVATE user secret.
@@ -204,8 +205,46 @@ def parse_results(text: str) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # 4. (Over)write the feature group
 # --------------------------------------------------------------------------- #
+SCANNED_AT_PREFIX = "scanned_at="
+FINDINGS_PREFIX = "findings="
+DESCRIPTION = ("Features suspected to be duplicates of one another, flagged by a claude -p analysis "
+               "of feature_group + cached_feature metadata.")
+SCHEMA = [
+    Feature("id", "bigint"),
+    Feature("feature_group", "string"),
+    Feature("feature_name", "string"),
+    Feature("reason", "string"),
+]
+
+
+def _existing_versions(fs) -> list[int]:
+    try:
+        return sorted(fg.version for fg in fs.get_feature_groups(FG_NAME))
+    except Exception:
+        return []  # older SDKs raise rather than return [] when nothing exists
+
+
 def write_feature_group(project, dupes: list[dict]) -> None:
+    """Publish this scan's result as a new version, then retire the older ones.
+
+    Every scan is a complete statement about the cluster, including one that finds nothing:
+    yesterday's duplicates were resolved, so yesterday's rows must go. An earlier form skipped
+    the write when the result was empty, which kept reporting findings that no longer existed.
+    The form before that deleted the previous version first, so a failed write lost the last
+    good result. Both are wrong ways round.
+
+    A new version is written first and the previous ones are deleted only once it is committed,
+    so the newest version is always a complete result and a failure at any point leaves the last
+    one in place. insert(overwrite=True) is not an option: it is unusable for DELTA feature
+    groups here, the backend's clear step recreating the group and invalidating the handle.
+
+    The scan time and the finding count go in the version's description. The executive dashboard
+    shows the time beside its own build time, because they are separate events and a fresh build
+    of a stale scan must not read as a fresh finding; it uses the count to recognise a clean scan,
+    because an empty DELTA feature group cannot be read at all.
+    """
     fs = project.get_feature_store()
+    scanned_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     df = pd.DataFrame(
         [{"id": i + 1,
           "feature_group": _s(d.get("feature_group")),
@@ -216,52 +255,34 @@ def write_feature_group(project, dupes: list[dict]) -> None:
     ).astype({"id": "int64", "feature_group": "string",
               "feature_name": "string", "reason": "string"})
 
-    # Nothing to write means nothing to replace. This used to drop the feature group and then
-    # report it as "left empty", so a run that found no duplicates destroyed the previous
-    # result and left the executive dashboard's count reading against a feature group that no
-    # longer existed. An empty result is not evidence that the last one was wrong.
-    if df.empty:
-        print("No suspected duplicates found; leaving the existing feature group untouched.")
-        return
-
-    # Clear-and-replace. NOTE: fg.insert(overwrite=True) is unusable for DELTA
-    # feature groups on this cluster — the backend's "clear" step recreates the
-    # FG and invalidates the in-memory id, so the follow-up commit 404s. Deleting
-    # the FG and recreating it, then a plain insert, is the reliable equivalent:
-    # it removes every row that was there and inserts only the new ones.
-    #
-    # The delete has to precede the create, so there is a window in which the previous result is
-    # gone and the new one is not yet written. It is not silent: a failure inside it says so, and
-    # names re-running as the recovery, rather than leaving an absent feature group to be
-    # discovered later by a dashboard reading zero.
-    existed = False
-    try:
-        fs.get_feature_group(FG_NAME, version=FG_VERSION).delete()
-        existed = True
-        print(f"Dropped existing '{FG_NAME}' v{FG_VERSION}.")
-    except Exception:
-        pass  # did not exist yet
-
-    try:
-        _create_and_insert(fs, df)
-    except Exception:
-        if existed:
-            print(f"ERROR: '{FG_NAME}' v{FG_VERSION} was dropped and its replacement could not be "
-                  f"written, so the previous result is gone. Re-run this script; the analysis is "
-                  f"recomputed from scratch and does not depend on what was there.", file=sys.stderr)
-        raise
-
-
-def _create_and_insert(fs, df) -> None:
+    previous = _existing_versions(fs)
+    version = (previous[-1] + 1) if previous else 1
     fg = fs.create_feature_group(
-        name=FG_NAME, version=FG_VERSION,
-        description="Features suspected to be duplicates of one another, flagged "
-                    "by a claude -p analysis of feature_group + cached_feature "
-                    "metadata.",
+        name=FG_NAME, version=version,
+        # The finding count travels in the description as well as in the rows. An empty DELTA
+        # feature group has a schema but no data files, and reading it fails with "no active
+        # delta files", which is indistinguishable from a broken read. The count lets a reader
+        # know a zero result is zero without attempting a read it knows will fail.
+        description=f"{DESCRIPTION} {SCANNED_AT_PREFIX}{scanned_at} {FINDINGS_PREFIX}{len(df)}",
         primary_key=["id"], online_enabled=False, time_travel_format="DELTA",
+        features=SCHEMA,
     )
-    fg.insert(df, wait=True)
-    print(f"Wrote {len(df)} row(s) to '{FG_NAME}' v{FG_VERSION}.")
+    if df.empty:
+        # The declared schema is what gives an empty result somewhere to exist: a version with
+        # no rows is the published statement that this scan found nothing.
+        fg.save(df)
+        print(f"Published '{FG_NAME}' v{version}: no suspected duplicates ({scanned_at}).")
+    else:
+        fg.insert(df, wait=True)
+        print(f"Published '{FG_NAME}' v{version}: {len(df)} row(s) ({scanned_at}).")
+
+    for old in previous:
+        try:
+            fs.get_feature_group(FG_NAME, version=old).delete()
+            print(f"Retired '{FG_NAME}' v{old}.")
+        except Exception as e:  # noqa: BLE001 - the new result is published; this is housekeeping
+            print(f"Could not retire '{FG_NAME}' v{old}: {e}. The newest version is the one read.",
+                  file=sys.stderr)
 
 
 def main() -> None:
