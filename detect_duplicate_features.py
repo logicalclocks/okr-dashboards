@@ -216,21 +216,43 @@ def write_feature_group(project, dupes: list[dict]) -> None:
     ).astype({"id": "int64", "feature_group": "string",
               "feature_name": "string", "reason": "string"})
 
+    # Nothing to write means nothing to replace. This used to drop the feature group and then
+    # report it as "left empty", so a run that found no duplicates destroyed the previous
+    # result and left the executive dashboard's count reading against a feature group that no
+    # longer existed. An empty result is not evidence that the last one was wrong.
+    if df.empty:
+        print("No suspected duplicates found; leaving the existing feature group untouched.")
+        return
+
     # Clear-and-replace. NOTE: fg.insert(overwrite=True) is unusable for DELTA
     # feature groups on this cluster — the backend's "clear" step recreates the
     # FG and invalidates the in-memory id, so the follow-up commit 404s. Deleting
     # the FG and recreating it, then a plain insert, is the reliable equivalent:
     # it removes every row that was there and inserts only the new ones.
+    #
+    # The delete has to precede the create, so there is a window in which the previous result is
+    # gone and the new one is not yet written. It is not silent: a failure inside it says so, and
+    # names re-running as the recovery, rather than leaving an absent feature group to be
+    # discovered later by a dashboard reading zero.
+    existed = False
     try:
         fs.get_feature_group(FG_NAME, version=FG_VERSION).delete()
+        existed = True
         print(f"Dropped existing '{FG_NAME}' v{FG_VERSION}.")
     except Exception:
         pass  # did not exist yet
 
-    if df.empty:
-        print("No suspected duplicates — feature group left empty.")
-        return
+    try:
+        _create_and_insert(fs, df)
+    except Exception:
+        if existed:
+            print(f"ERROR: '{FG_NAME}' v{FG_VERSION} was dropped and its replacement could not be "
+                  f"written, so the previous result is gone. Re-run this script; the analysis is "
+                  f"recomputed from scratch and does not depend on what was there.", file=sys.stderr)
+        raise
 
+
+def _create_and_insert(fs, df) -> None:
     fg = fs.create_feature_group(
         name=FG_NAME, version=FG_VERSION,
         description="Features suspected to be duplicates of one another, flagged "
