@@ -226,12 +226,32 @@ def chart_specs():
 
 
 def replace_chart(api, slice_name, viz_type, dataset_id, params):
-    for c in list_all(api, "chart"):
-        if c.get("slice_name") == slice_name:
-            api.delete_chart(c["id"])
-    return api.create_chart(
-        slice_name=slice_name, viz_type=viz_type, datasource_id=dataset_id,
-        params=json.dumps(params))["id"]
+    """Reconcile a chart by name, updating in place where one already exists.
+
+    This deleted every chart with a matching title before creating a replacement. A failure
+    between the two left the published dashboard missing charts; a success changed the chart id
+    and so dropped it out of any other dashboard reusing it; and matching on title alone gave no
+    ownership boundary against a chart somebody else had named the same. Ownership here is the
+    dataset: our title on our dataset is ours to update.
+    """
+    named = [c for c in list_all(api, "chart") if c.get("slice_name") == slice_name]
+    ours = [c for c in named if c.get("datasource_id") == dataset_id]
+    if not ours and named:
+        raise RuntimeError(
+            f"A chart named '{slice_name}' already exists on datasource(s) "
+            f"{[c.get('datasource_id') for c in named]}, not on this dashboard's dataset "
+            f"{dataset_id}. Refusing to overwrite a chart that may not be ours; rename or remove "
+            f"it and re-run.")
+    body = dict(slice_name=slice_name, viz_type=viz_type, datasource_id=dataset_id,
+                datasource_type="table", params=json.dumps(params))
+    if ours:
+        chart_id = ours[0]["id"]
+        api.update_chart(chart_id, **body)
+    else:
+        chart_id = api.create_chart(**body)["id"]
+    for dup in ours[1:]:
+        api.delete_chart(dup["id"])
+    return chart_id
 
 
 # --------------------------------------------------------------------------- #

@@ -262,16 +262,47 @@ class Superset:
     # -- charts and dashboards ---------------------------------------------- #
 
     def replace_chart(self, spec: ChartSpec, dataset_id: int) -> Chart:
-        """Recreate a chart by name, so re-running is idempotent."""
-        for chart in list(self._each("chart")):
-            if chart.get("slice_name") == spec.name:
-                self.api.delete_chart(chart["id"])
-        chart_id = self.api.create_chart(
-            slice_name=spec.name,
-            viz_type=spec.viz_type,
-            datasource_id=dataset_id,
-            params=json.dumps(spec.params),
-        )["id"]
+        """Reconcile a chart by name, updating in place where one already exists.
+
+        This used to delete every chart with a matching title and then create a
+        replacement. Three things went wrong with that. A failure between the two
+        left the published dashboard missing charts, and the scheduled tag refresh
+        reaches this path. A successful run changed the chart id, which drops the
+        chart out of any other dashboard that reused it. And deleting on title
+        alone has no ownership boundary, so a chart somebody else happened to name
+        the same was destroyed.
+
+        Ownership is the dataset: a chart with our title sitting on our dataset is
+        ours to update. One with our title on a different datasource is not
+        touched, because it cannot be told apart from a user's own chart, and
+        clobbering it is precisely what this is fixing.
+        """
+        named = [c for c in self._each("chart") if c.get("slice_name") == spec.name]
+        ours = [c for c in named if c.get("datasource_id") == dataset_id]
+        if not ours and named:
+            raise RuntimeError(
+                f"A chart named '{spec.name}' already exists on datasource(s) "
+                f"{[c.get('datasource_id') for c in named]}, not on this dashboard's dataset "
+                f"{dataset_id}. Refusing to overwrite a chart that may not be ours; rename or "
+                f"remove it and re-run."
+            )
+        body = {
+            "slice_name": spec.name,
+            "viz_type": spec.viz_type,
+            "datasource_id": dataset_id,
+            "datasource_type": "table",
+            "params": json.dumps(spec.params),
+        }
+        if ours:
+            # In place, so the id survives and every dashboard holding this chart keeps it.
+            chart_id = ours[0]["id"]
+            self.api.update_chart(chart_id, **body)
+        else:
+            chart_id = self.api.create_chart(**body)["id"]
+        # Duplicates under the same title on our own dataset are debris from the
+        # delete-and-create era. Removed only after the survivor is in place.
+        for dup in ours[1:]:
+            self.api.delete_chart(dup["id"])
         return Chart(id=chart_id, spec=spec)
 
     def ensure_dashboard(
