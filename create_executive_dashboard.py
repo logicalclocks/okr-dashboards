@@ -100,19 +100,47 @@ _HAS_MODEL_ARTIFACT = """EXISTS (
 # leaving the read-only user with no SELECT grants at all. Any entry added here
 # must name a table that exists and is in $roTables in hopsworks-helm's
 # grants.sql.template.
-ACTUAL_SQL = {
-    "features": ("(SELECT COUNT(*) FROM hopsworks.cached_feature)"
-                 " + (SELECT COUNT(*) FROM hopsworks.on_demand_feature)"
-                 " + (SELECT COUNT(*) FROM hopsworks.embedding_feature)"),
-    # The target is named for feature views, the KPI chart counts feature views,
-    # so the detail actual counts them too. It counted hopsworks.model, which
-    # made the two panels disagree for the same OKR.
-    "feature views (models)": "(SELECT COUNT(*) FROM hopsworks.feature_view)",
-    "model deployments": f"(SELECT COUNT(*) FROM hopsworks.serving s WHERE {_HAS_MODEL_ARTIFACT})",
-    "agent deployments": f"(SELECT COUNT(*) FROM hopsworks.serving s WHERE NOT {_HAS_MODEL_ARTIFACT})",
-    "dashboards": "(SELECT COUNT(*) FROM hopsworks.dashboard)",
-    "apps": "(SELECT COUNT(*) FROM hopsworks.jobs WHERE type = 'PYTHON_APP')",
-}
+# Deployment tags live in model_registry_tag_value keyed by serving_id, with the schema in
+# feature_store_tag like every other tag value table. okrs.sh asks for "production" deployment
+# targets, so the actual is filtered to the lifecycle tag's prod status. It counted every row in
+# serving, which reported an unfiltered total against a production target.
+def _deployment_actual(tag: str, with_artifact: bool) -> str:
+    negate = "" if with_artifact else "NOT "
+    return (
+        "(SELECT COUNT(*) FROM hopsworks.serving s"
+        f" WHERE {negate}{_HAS_MODEL_ARTIFACT}"
+        " AND EXISTS ("
+        "   SELECT 1 FROM hopsworks.model_registry_tag_value tv"
+        "   JOIN hopsworks.feature_store_tag t ON t.id = tv.schema_id"
+        f"     AND t.name = {sql_str(tag)}"
+        "   WHERE tv.serving_id = s.id"
+        "     AND JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) = 'prod'))"
+    )
+
+
+def actual_sql(tag: str) -> dict[str, str]:
+    """Metric name -> scalar SQL counting the live rows behind it."""
+    return {
+        "features": ("(SELECT COUNT(*) FROM hopsworks.cached_feature)"
+                     " + (SELECT COUNT(*) FROM hopsworks.on_demand_feature)"
+                     " + (SELECT COUNT(*) FROM hopsworks.embedding_feature)"),
+        # The target is named for feature views, the KPI chart counts feature views, so the
+        # detail actual counts them too. It counted hopsworks.model, which made the two panels
+        # disagree for the same OKR.
+        "feature views (models)": "(SELECT COUNT(*) FROM hopsworks.feature_view)",
+        "model deployments": _deployment_actual(tag, True),
+        "agent deployments": _deployment_actual(tag, False),
+        "dashboards": "(SELECT COUNT(*) FROM hopsworks.dashboard)",
+        "apps": "(SELECT COUNT(*) FROM hopsworks.jobs WHERE type = 'PYTHON_APP')",
+    }
+
+
+# The metric names this dashboard can compute. Kept apart from the SQL because validating a
+# target does not need the lifecycle tag, which is only resolved once a connection exists.
+SUPPORTED_METRICS = frozenset({
+    "features", "feature views (models)", "model deployments", "agent deployments",
+    "dashboards", "apps",
+})
 
 # Names that earlier builds wrote into the `okrs` feature group, mapped onto the
 # canonical ones. Setup has always written "feature views (models)" while the
@@ -441,7 +469,7 @@ def run_sql(api, db_id, sql):
 def load_targets(project):
     """Read OKR targets from the `okrs` feature group -> {canonical metric: target}.
 
-    Names are resolved through TARGET_ALIASES and then checked against ACTUAL_SQL.
+    Names are resolved through TARGET_ALIASES and then checked against SUPPORTED_METRICS.
     An unrecognised name stops the build instead of becoming a zero actual, which
     is what let a configured target of 10 render as 0 with NULL attainment.
     """
@@ -451,7 +479,7 @@ def load_targets(project):
     unknown = []
     for _, r in df.iterrows():
         name = TARGET_ALIASES.get(str(r["target"]), str(r["target"]))
-        if name not in ACTUAL_SQL:
+        if name not in SUPPORTED_METRICS:
             unknown.append(str(r["target"]))
             continue
         targets[name] = int(r["value"])
@@ -459,8 +487,8 @@ def load_targets(project):
         sys.exit(
             f"Unsupported OKR target(s) in the '{OKRS_FG}' feature group: "
             + ", ".join(sorted(set(unknown)))
-            + ".\nSupported: " + ", ".join(sorted(ACTUAL_SQL))
-            + ".\nFix the row or add the metric to ACTUAL_SQL; it cannot be counted as it stands."
+            + ".\nSupported: " + ", ".join(sorted(SUPPORTED_METRICS))
+            + ".\nFix the row or add the metric to actual_sql(); it cannot be counted as it stands."
         )
     if not targets:
         sys.exit(f"No targets found in the '{OKRS_FG}' feature group")
@@ -506,13 +534,17 @@ def build_dup_features_counts_sql(project):
             "WHERE times_suspected > 0 ORDER BY times_suspected DESC")
 
 
-def build_sql(targets):
-    """UNION one row per OKR: metric, embedded target, live MySQL actual."""
+def build_sql(targets, tag):
+    """UNION one row per OKR: metric, embedded target, live MySQL actual.
+
+    `tag` is the resolved lifecycle tag; the deployment actuals filter on its prod status.
+    """
+    actuals = actual_sql(tag)
     rows = []
     for metric, target in targets.items():
         # Unconditional: load_targets rejects any name without an entry, so a
         # KeyError here is a bug in this file rather than bad customer data.
-        actual = ACTUAL_SQL[metric]
+        actual = actuals[metric]
         esc = metric.replace("'", "''")
         rows.append(f"    SELECT '{esc}' AS metric, {int(target)} AS target, "
                     f"({actual}) AS actual")
@@ -1020,7 +1052,7 @@ def main():
     for metric, target in targets.items():
         print(f"  {metric}: {target}")
 
-    sql = build_sql(targets)
+    sql = build_sql(targets, tag)
     print("\nGenerated OKR-progress SQL:\n")
     print(sql)
 
