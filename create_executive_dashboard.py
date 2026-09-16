@@ -33,6 +33,7 @@ Run:  python create_executive_dashboard.py
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 
 import hopsworks
 
@@ -853,8 +854,14 @@ def replace_chart(api, slice_name, viz_type, dataset_id, params):
     return chart_id
 
 
-def build_position_json(charts, title):
-    """charts: list of {id, name, width, height}. Greedily pack rows to 12 cols."""
+def build_position_json(charts, title, note=None):
+    """charts: list of {id, name, width, height}. Greedily pack rows to 12 cols.
+
+    ``note`` is markdown placed above the first row. This dashboard embeds targets and
+    duplicate-feature counts as SQL literals taken when the builder last ran, so the note is
+    where the snapshot's age is stated: nothing else on the page distinguishes a number read
+    a minute ago from one read last quarter.
+    """
     layout = {
         "DASHBOARD_VERSION_KEY": "v2",
         "ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": ["GRID_ID"]},
@@ -873,6 +880,15 @@ def build_position_json(charts, title):
                           "parents": ["ROOT_ID", "GRID_ID"],
                           "meta": {"background": "BACKGROUND_TRANSPARENT"}}
         layout["GRID_ID"]["children"].append(row_id)
+
+    if note:
+        new_row()
+        layout["MARKDOWN-note"] = {
+            "type": "MARKDOWN", "id": "MARKDOWN-note", "children": [],
+            "parents": ["ROOT_ID", "GRID_ID", row_id],
+            "meta": {"width": 12, "height": 6, "code": note},
+        }
+        layout[row_id]["children"].append("MARKDOWN-note")
 
     new_row()
     for ch in charts:
@@ -952,8 +968,8 @@ def project_filter_metadata(dataset_id, scoped_chart_ids, all_chart_ids):
     }
 
 
-def ensure_dashboard(api, title, charts, json_metadata=None):
-    position_json = build_position_json(charts, title)
+def ensure_dashboard(api, title, charts, json_metadata=None, note=None):
+    position_json = build_position_json(charts, title, note)
     dash_id = next((d["id"] for d in list_all(api, "dashboard")
                     if d.get("dashboard_title") == title), None)
     kwargs = {"dashboard_title": title, "published": True,
@@ -1111,7 +1127,17 @@ def main():
         ],
         "cross_filters_enabled": False,
     })
-    dash_id = ensure_dashboard(api, DASHBOARD_TITLE, charts, json_metadata)
+    # The targets and the duplicate-feature counts on this page are SQL literals, fixed when this
+    # builder runs. Editing the okrs feature group or re-running the duplicate detector does not
+    # change them, and neither does the wizard's Refresh Dashboard Now, which rebuilds the tag
+    # dashboards only. Stating when they were taken is what makes a stale number recognisable;
+    # refresh_dashboards.py re-runs this builder alongside the tag datasets.
+    taken = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    note = (f"**OKR targets and duplicate-feature counts are a snapshot taken {taken}.** "
+            "Every other number on this page is read live. Re-run "
+            "`refresh_dashboards.py` (or `create_executive_dashboard.py`) after changing the "
+            "`okrs` feature group or running the duplicate detector.")
+    dash_id = ensure_dashboard(api, DASHBOARD_TITLE, charts, json_metadata, note=note)
     print(f"\nDashboard '{DASHBOARD_TITLE}' ready (id={dash_id}).")
     print(f"Open it: {host}/hopsworks-api/superset/superset/dashboard/{dash_id}/")
 

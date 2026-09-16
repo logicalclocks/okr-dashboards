@@ -61,9 +61,11 @@ Here is the json for the 'status' schematized tag:
 Build the executive dashboard by running 'create_executive_dashboard.py'. This reads the targets from the okrs feature group and pairs each one against its live actual, computed from the real hopsworks metadata tables via the hopsworks_analytics JDBC connection in Superset (no Trino). Re-run it after the OKR targets change to refresh them. Note that when you mount the MySQL tables as feature groups, it can rename columns. You will create the dashboards against the MySQL tables, so use its colun names.
 
 
-Then, when `schedule_daily_tag_job` is `yes`, create a Python job to run 'create_tag_dataset.py' once/day by default at 04.00. Use 1 CPU and 4 GB of memory in the job.
+Then, when `schedule_daily_tag_job` is `yes`, create a Python job to run 'refresh_dashboards.py' once/day by default at 04.00. Use 1 CPU and 4 GB of memory in the job.
 
-Name that job exactly `update-tag-dataset`. This is a contract, not a preference: the Hopsworks UI's "Refresh Dashboard Now" action looks the job up by that literal name (ANALYTICS_TAG_JOB in hopsworks-front's `src/modules/wizard/Wizard.tsx`). Any other name and the action 404s and tells the user to run Setup Analytics first, which they will already have done.
+Run 'refresh_dashboards.py', not 'create_tag_dataset.py' directly. It runs the tag datasets and then the executive dashboard, which is the set whose numbers are snapshots rather than live reads. The executive dashboard embeds its OKR targets and duplicate-feature counts as SQL literals fixed at build time, so a job that rebuilt only the tag datasets left those reporting whatever they held when the dashboard was first created, however often it ran.
+
+Name that job exactly `update-tag-dataset`. This is a contract, not a preference: the Hopsworks UI's "Refresh Dashboard Now" action looks the job up by that literal name (ANALYTICS_TAG_JOB in hopsworks-front's `src/modules/wizard/Wizard.tsx`). Any other name and the action 404s and tells the user to run Setup Analytics first, which they will already have done. The name is now slightly narrower than what the job does, and it stays as it is because the UI depends on the literal.
 
 
 When `create_dashboards_now` is `yes`, create the dashboards (executive, developer, others).
