@@ -84,8 +84,17 @@ FROM (
         h.event_time AS added_on,
         LEAD(h.event_time) OVER (
             PARTITION BY h.artifact_type, h.artifact_id, h.tag_name, h.tag_key
+            -- event_time then id. id is the insertion order, and the writer emits a
+            -- value change as CLOSED-then-OPENED inside one transaction, so id already
+            -- carries the right order for the case the CASE below used to handle. The
+            -- CASE forced CLOSED first at an equal timestamp, which is exactly backwards
+            -- for an attach and a detach that share a millisecond: it ordered the CLOSED
+            -- before the OPENED that preceded it, leaving a removed tag reading as
+            -- current forever. Residual, stated on HWORKS-2895: NDB allocates
+            -- auto-increment ids per mysqld node, so two events written a millisecond
+            -- apart through different nodes can still order arbitrarily. Closing that
+            -- needs a real per-key sequence, not a tie-break.
             ORDER BY h.event_time,
-                     CASE WHEN h.event_type = 'CLOSED' THEN 0 ELSE 1 END,
                      h.id
         ) AS removed_at,
         CASE
