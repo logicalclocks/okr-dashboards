@@ -30,10 +30,22 @@ This program:
 
 Run:  python create_executive_dashboard.py
 """
+import argparse
 import json
 import sys
+from datetime import datetime, timezone
 
 import hopsworks
+
+from superset import (
+    TERMINAL_STATUS,
+    attach_charts,
+    ensure_dataset,
+    lifecycle_status_values,
+    resolve_analytics_database,
+    resolve_lifecycle_tag,
+    sql_str,
+)
 
 SCHEMA = "hopsworks"                       # MySQL schema holding the metadata tables
 OKRS_FG = "okrs"
@@ -64,41 +76,99 @@ RETIRED_CHARTS = [
     f"{CHART_PREFIX}Pipeline Lifecycle Funnel — Feature Groups",  # -> for Features
 ]
 
+# A deployment is a model deployment when a model artifact is attached to it and
+# an agent deployment when none is. Both are rows in `serving`, so counting that
+# table alone reports every agent as a model. This is the same predicate the
+# lifecycle and promotion builders use.
+_HAS_MODEL_ARTIFACT = """EXISTS (
+            SELECT 1 FROM hopsworks.serving_deployment sd
+            JOIN hopsworks.serving_model_artifact sma ON sma.serving_depl_id = sd.id
+            WHERE sd.serving_id = s.id
+        )"""
+
 # Live MySQL actual for each OKR metric: a scalar SQL expression counting the
-# real Hopsworks metadata rows. Keyed by the metric name stored in the `okrs`
-# FG. A metric with no entry here falls back to the literal 0, so an OKR can
-# carry a target without a table behind it.
+# real Hopsworks metadata rows, keyed by the canonical metric name.
 #
-# "agent deployments" is one of those: it used to count hopsworks.agent, but
-# that table was dropped by hopsworks-ee migration V82 ([HWORKS-2789], remove
-# brewer) and no longer exists in the schema, so the query failed with
-# "Table 'hopsworks.agent' doesn't exist". Adding the table to the read-only
-# grant list is not the fix — a GRANT on a table that does not exist fails too,
-# and it would fail after the REVOKE that precedes it, leaving the read-only
-# user with no SELECT grants at all. Restore an entry here only against a table
-# that exists and is in $roTables in hopsworks-helm's grants.sql.template.
-ACTUAL_SQL = {
-    "features": ("(SELECT COUNT(*) FROM hopsworks.cached_feature)"
-                 " + (SELECT COUNT(*) FROM hopsworks.on_demand_feature)"
-                 " + (SELECT COUNT(*) FROM hopsworks.embedding_feature)"),
-    "models": "(SELECT COUNT(*) FROM hopsworks.model)",
-    "model deployments": "(SELECT COUNT(*) FROM hopsworks.serving)",
-    "dashboards": "(SELECT COUNT(*) FROM hopsworks.dashboard)",
-    "apps": "(SELECT COUNT(*) FROM hopsworks.jobs WHERE type = 'PYTHON_APP')",
+# Every name setup can write has an entry. A metric with no entry is rejected
+# rather than silently counted as zero: a target of 10 reported against a
+# literal 0 actual reads as "nothing built yet" rather than as a broken
+# dashboard, and that is the one failure an executive dashboard must not have.
+#
+# The `agent` table was dropped by hopsworks-ee migration V82 ([HWORKS-2789],
+# remove brewer), so agent deployments are counted from `serving` by the absence
+# of a model artifact rather than from a table of their own. Adding a dropped
+# table to the read-only grant list is never the fix: a GRANT on a table that
+# does not exist fails too, and it fails after the REVOKE that precedes it,
+# leaving the read-only user with no SELECT grants at all. Any entry added here
+# must name a table that exists and is in $roTables in hopsworks-helm's
+# grants.sql.template.
+# Deployment tags live in model_registry_tag_value keyed by serving_id, with the schema in
+# feature_store_tag like every other tag value table. okrs.sh asks for "production" deployment
+# targets, so the actual is filtered to the lifecycle tag's prod status. It counted every row in
+# serving, which reported an unfiltered total against a production target.
+def _deployment_actual(tag: str, with_artifact: bool) -> str:
+    negate = "" if with_artifact else "NOT "
+    return (
+        "(SELECT COUNT(*) FROM hopsworks.serving s"
+        f" WHERE {negate}{_HAS_MODEL_ARTIFACT}"
+        " AND EXISTS ("
+        "   SELECT 1 FROM hopsworks.model_registry_tag_value tv"
+        "   JOIN hopsworks.feature_store_tag t ON t.id = tv.schema_id"
+        f"     AND t.name = {sql_str(tag)}"
+        "   WHERE tv.serving_id = s.id"
+        "     AND JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) = 'prod'))"
+    )
+
+
+def actual_sql(tag: str) -> dict[str, str]:
+    """Metric name -> scalar SQL counting the live rows behind it."""
+    return {
+        # Setup asks for *production* features and feature views, and the KPI panels filter on
+        # the lifecycle tag's prod status. The detail row has to count the same population, or
+        # the two disagree on one screen: with one production view and 99 in development against
+        # a target of 10, the KPI read 10% and this row read 1000%. Both are built from the same
+        # status subqueries the KPI datasets use, so they cannot drift apart again.
+        "features": (f"(SELECT COUNT(*) FROM ({feature_status_sql(tag)}) f"
+                     " WHERE f.fg_status = 'prod')"),
+        "feature views (models)": (f"(SELECT COUNT(*) FROM ({fv_status_sql(tag)}) v"
+                                   " WHERE v.fv_status = 'prod')"),
+        "model deployments": _deployment_actual(tag, True),
+        "agent deployments": _deployment_actual(tag, False),
+        "dashboards": "(SELECT COUNT(*) FROM hopsworks.dashboard)",
+        "apps": "(SELECT COUNT(*) FROM hopsworks.jobs WHERE type = 'PYTHON_APP')",
+    }
+
+
+# The metric names this dashboard can compute. Kept apart from the SQL because validating a
+# target does not need the lifecycle tag, which is only resolved once a connection exists.
+SUPPORTED_METRICS = frozenset({
+    "features", "feature views (models)", "model deployments", "agent deployments",
+    "dashboards", "apps",
+})
+
+# Names that earlier builds wrote into the `okrs` feature group, mapped onto the
+# canonical ones. Setup has always written "feature views (models)" while the
+# builder looked up "models", so every cluster configured through okrs.sh has a
+# row under a name the builder did not resolve. Rows are not rewritten: the
+# feature group is the customer's, and a rename on read costs nothing.
+TARGET_ALIASES = {
+    "models": "feature views (models)",
+    "feature views": "feature views (models)",
 }
 
 # The `asset` tag carries one lifecycle value per feature group in
 # its `status` field (enum: deprecated / prod / rnd / uat), e.g.
 # {"status":"prod"}. fg_status is NULL for feature groups with no such tag.
 # Joined by tag name (not a hard-coded schema id) so it survives re-registration.
-FG_STATUS_SQL = (
-    "SELECT tv.feature_group_id,"
-    " JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS fg_status"
-    " FROM hopsworks.feature_store_tag_value tv"
-    " JOIN hopsworks.feature_store_tag t"
-    "   ON t.id = tv.schema_id AND t.name = 'asset'"
-    " WHERE tv.feature_group_id IS NOT NULL"
-)
+def fg_status_sql(tag):
+    return (
+        "SELECT tv.feature_group_id,"
+        " JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS fg_status"
+        " FROM hopsworks.feature_store_tag_value tv"
+        " JOIN hopsworks.feature_store_tag t"
+        f"   ON t.id = tv.schema_id AND t.name = {sql_str(tag)}"
+        " WHERE tv.feature_group_id IS NOT NULL"
+    )
 
 # One row per feature, carrying its feature group's `asset` value
 # (fg_status). Drives the feature KPI panels by COUNTing rows filtered on
@@ -114,7 +184,10 @@ FG_STATUS_SQL = (
 # value on fg_id. (Tags live on feature_group.id, so joining the subtype id
 # directly silently matches nothing.)
 FEATURE_STATUS_DATASET = "feature_okr_status"
-FEATURE_STATUS_SQL = f"""SELECT feature_id, feature_kind, s.fg_status FROM (
+def feature_status_sql(tag):
+    return f"""SELECT feature_id, feature_kind, s.fg_status,
+       COALESCE(p.projectname, '(unknown)') AS project_name
+FROM (
     SELECT cf.id AS feature_id, 'cached' AS feature_kind, fg.id AS fg_id
     FROM hopsworks.cached_feature cf
     JOIN hopsworks.feature_group fg
@@ -132,20 +205,24 @@ FEATURE_STATUS_SQL = f"""SELECT feature_id, feature_kind, s.fg_status FROM (
     FROM hopsworks.embedding_feature ef
     JOIN hopsworks.embedding e ON e.id = ef.embedding_id
 ) feats
-LEFT JOIN ({FG_STATUS_SQL}) s ON s.feature_group_id = feats.fg_id"""
+LEFT JOIN ({fg_status_sql(tag)}) s ON s.feature_group_id = feats.fg_id
+LEFT JOIN hopsworks.feature_group ownfg ON ownfg.id = feats.fg_id
+LEFT JOIN hopsworks.feature_store ownfs ON ownfs.id = ownfg.feature_store_id
+LEFT JOIN hopsworks.project p ON p.id = ownfs.project_id"""
 
 
 # One row per feature view + its own asset tag value (fv_status,
 # NULL when the FV carries no such tag). The tag can be attached to a feature
 # view via feature_store_tag_value.feature_view_id, mirroring the FG case.
-FV_STATUS_SQL = """SELECT fv.id AS fv_id, s.fv_status
+def fv_status_sql(tag):
+    return f"""SELECT fv.id AS fv_id, s.fv_status
 FROM hopsworks.feature_view fv
 LEFT JOIN (
     SELECT tv.feature_view_id,
            JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) AS fv_status
     FROM hopsworks.feature_store_tag_value tv
     JOIN hopsworks.feature_store_tag t
-      ON t.id = tv.schema_id AND t.name = 'asset'
+      ON t.id = tv.schema_id AND t.name = {sql_str(tag)}
     WHERE tv.feature_view_id IS NOT NULL
 ) s ON s.feature_view_id = fv.id"""
 # Backs the "Production Model Progression" KPI: COUNT(*) WHERE fv_status='prod'
@@ -157,18 +234,20 @@ FV_STATUS_DATASET = "fv_status"
 # each feature column of a feature view (feature_view_id set); we attach the
 # view's status. Used to count features-in-feature-views by status (not the
 # number of feature views).
-FV_FEATURE_STATUS_SQL = f"""SELECT tdf.id AS feature_id, fvs.fv_status
+def fv_feature_status_sql(tag):
+    return f"""SELECT tdf.id AS feature_id, fvs.fv_status
 FROM hopsworks.training_dataset_feature tdf
-JOIN ({FV_STATUS_SQL}) fvs ON fvs.fv_id = tdf.feature_view_id
+JOIN ({fv_status_sql(tag)}) fvs ON fvs.fv_id = tdf.feature_view_id
 WHERE tdf.feature_view_id IS NOT NULL"""
 
 # Prod-tagged feature views: the set of feature_view ids carrying the `asset`
 # tag with status='prod'. Reused below for both the reuse count and the
 # reuse-percentage series.
-_PROD_FV_IDS = """
+def prod_fv_ids(tag):
+    return f"""
         SELECT tv.feature_view_id FROM hopsworks.feature_store_tag_value tv
         JOIN hopsworks.feature_store_tag t
-          ON t.id = tv.schema_id AND t.name = 'asset'
+          ON t.id = tv.schema_id AND t.name = {sql_str(tag)}
         WHERE tv.feature_view_id IS NOT NULL
           AND JSON_UNQUOTE(JSON_EXTRACT(tv.value, '$.status')) = 'prod'""".strip()
 
@@ -191,7 +270,8 @@ _TOTAL_FEATURES = ("(SELECT COUNT(*) FROM hopsworks.cached_feature)"
 #                       appears in any prod FV); denominator is the current total
 #                       feature count. Backs the secondary-axis percentage line.
 FEATURE_REUSE_DATASET = "feature_reuse_daily"
-FEATURE_REUSE_SQL = f"""SELECT d.day,
+def feature_reuse_sql(tag):
+    return f"""SELECT d.day,
        SUM(d.daily_count) OVER (ORDER BY d.day) AS cumulative_count,
        SUM(COALESCE(nf.new_features, 0)) OVER (ORDER BY d.day)
          / NULLIF({_TOTAL_FEATURES}, 0) AS reuse_pct
@@ -200,7 +280,7 @@ FROM (
     FROM hopsworks.training_dataset_feature tdf
     JOIN hopsworks.feature_view fv ON fv.id = tdf.feature_view_id
     WHERE tdf.feature_view_id IS NOT NULL
-      AND fv.id IN ({_PROD_FV_IDS})
+      AND fv.id IN ({prod_fv_ids(tag)})
     GROUP BY DATE(fv.created)
 ) d
 LEFT JOIN (
@@ -209,7 +289,7 @@ LEFT JOIN (
         FROM hopsworks.training_dataset_feature tdf
         JOIN hopsworks.feature_view fv ON fv.id = tdf.feature_view_id
         WHERE tdf.feature_view_id IS NOT NULL
-          AND fv.id IN ({_PROD_FV_IDS})
+          AND fv.id IN ({prod_fv_ids(tag)})
         GROUP BY tdf.name, tdf.feature_group
     ) ff
     GROUP BY first_day
@@ -222,23 +302,60 @@ ORDER BY d.day"""
 # re-sort by count); 'qa' is included even though it is not in the asset enum
 # (shows 0 until used), and 'deprecated' is intentionally excluded.
 FG_FUNNEL_DATASET = "fg_lifecycle_funnel"
-FG_FUNNEL_STAGES = [
-    ("untagged", "fs.fg_status IS NULL"),
-    ("rnd", "fs.fg_status = 'rnd'"),
-    ("uat", "fs.fg_status = 'uat'"),
-    ("qa", "fs.fg_status = 'qa'"),
-    ("prod", "fs.fg_status = 'prod'"),
-]
 
 
-def build_fg_funnel_sql():
-    rows = []
-    for i, (name, cond) in enumerate(FG_FUNNEL_STAGES, 1):
-        cnt = f"(SELECT COUNT(*) FROM ({FEATURE_STATUS_SQL}) fs WHERE {cond})"
-        rows.append(f"    SELECT {i} AS sort_order, '{i}. {name}' AS stage, "
-                    f"{cnt} AS cnt")
-    union = "\n    UNION ALL\n".join(rows)
-    return f"SELECT sort_order, stage, cnt FROM (\n{union}\n) t ORDER BY sort_order"
+def funnel_stages(status_values):
+    """(label, predicate) per funnel stage, from the values the tag schema declares.
+
+    `untagged` leads because an asset with no lifecycle tag has not entered the funnel.
+    `deprecated` is left out: it is where assets go, not a step on the way to production,
+    and including it would put a terminal state in the middle of a progression.
+    """
+    stages = [("untagged", "fs.fg_status IS NULL")]
+    stages += [(v, f"fs.fg_status = {sql_str(v)}")
+               for v in status_values if v != TERMINAL_STATUS]
+    return stages
+
+
+def build_fg_funnel_sql(tag, status_values):
+    """Feature counts per lifecycle stage, per project.
+
+    One pass grouped by (stage, project) rather than one scalar count per stage: with a
+    project dimension the old shape would have been five correlated counts for every
+    project on the cluster.
+
+    The zero-count seed keeps every stage on the chart when nothing has reached it, which
+    is what the numbered stage labels are for -- a stage that vanishes reads as a stage
+    that does not exist. The seed carries no project, so selecting one drops it, which is
+    the right answer: an empty stage in a filtered view is empty for that project.
+    """
+    order = "\n".join(f"                WHEN {cond} THEN {i}"
+                      for i, (_, cond) in enumerate(funnel_stages(status_values), 1))
+    label = "\n".join(f"                WHEN {cond} THEN '{i}. {name}'"
+                      for i, (name, cond) in enumerate(funnel_stages(status_values), 1))
+    seed = "\n    UNION ALL\n".join(
+        # The NULL comes from the column itself rather than a literal: `hopsworks` columns
+        # are latin1_general_cs while a literal takes the connection collation, and MySQL
+        # rejects the UNION outright ("Illegal mix of collations") rather than coercing.
+        f"    SELECT {i} AS sort_order, '{i}. {name}' AS stage,"
+        f" (SELECT seedp.projectname FROM hopsworks.project seedp WHERE 1 = 0)"
+        f" AS project_name, 0 AS cnt"
+        for i, (name, _) in enumerate(funnel_stages(status_values), 1))
+    return f"""SELECT sort_order, stage, project_name, cnt FROM (
+    SELECT CASE
+{order}
+           END AS sort_order,
+           CASE
+{label}
+           END AS stage,
+           fs.project_name AS project_name,
+           COUNT(*) AS cnt
+    FROM ({feature_status_sql(tag)}) fs
+    GROUP BY 1, 2, fs.project_name
+    HAVING sort_order IS NOT NULL
+    UNION ALL
+{seed}
+) t ORDER BY sort_order"""
 
 
 # Feature popularity: how many distinct feature views each feature is used in.
@@ -247,13 +364,16 @@ def build_fg_funnel_sql():
 # an integer (COUNT DISTINCT feature views). Backs the "Most Popular Features"
 # top-20 bar chart.
 FEATURE_POPULARITY_DATASET = "feature_popularity"
-FEATURE_POPULARITY_SQL = """SELECT feature, fv_count FROM (
+FEATURE_POPULARITY_SQL = """SELECT feature, project_name, fv_count FROM (
     SELECT CONCAT(tdf.name, ' (', COALESCE(fg.name, '?'), ')') AS feature,
+           COALESCE(p.projectname, '(unknown)') AS project_name,
            COUNT(DISTINCT tdf.feature_view_id) AS fv_count
     FROM hopsworks.training_dataset_feature tdf
     LEFT JOIN hopsworks.feature_group fg ON fg.id = tdf.feature_group
+    LEFT JOIN hopsworks.feature_store fs ON fs.id = fg.feature_store_id
+    LEFT JOIN hopsworks.project p ON p.id = fs.project_id
     WHERE tdf.feature_view_id IS NOT NULL
-    GROUP BY tdf.name, fg.name
+    GROUP BY tdf.name, fg.name, p.projectname
 ) t ORDER BY fv_count DESC"""
 
 # Model time-to-market velocity: per model version, the number of days between
@@ -265,22 +385,24 @@ FEATURE_POPULARITY_SQL = """SELECT feature, fv_count FROM (
 # per model version. ttm_days backs the TTM Velocity histogram. Negative spans
 # (model older than its FV — clock skew / re-registration) are dropped.
 MODEL_TTM_DATASET = "model_ttm_velocity"
-MODEL_TTM_SQL = """SELECT model_name, model_version, model_created, fv_created,
-       ttm_days
+MODEL_TTM_SQL = """SELECT model_name, project_name, model_version, model_created,
+       fv_created, ttm_days
 FROM (
     SELECT m.name AS model_name,
+           COALESCE(p.projectname, '(unknown)') AS project_name,
            mv.version AS model_version,
            mv.created AS model_created,
            MIN(fv.created) AS fv_created,
            DATEDIFF(mv.created, MIN(fv.created)) AS ttm_days
     FROM hopsworks.model_version mv
     JOIN hopsworks.model m ON m.id = mv.model_id
+    LEFT JOIN hopsworks.project p ON p.id = m.project_id
     JOIN hopsworks.model_link ml ON ml.model_version_id = mv.id
     JOIN hopsworks.feature_view fv
           ON fv.name = ml.parent_feature_view_name
          AND fv.version = ml.parent_feature_view_version
     WHERE mv.created IS NOT NULL
-    GROUP BY mv.id, m.name, mv.version, mv.created
+    GROUP BY mv.id, m.name, p.projectname, mv.version, mv.created
 ) t
 WHERE fv_created IS NOT NULL AND ttm_days >= 0
 ORDER BY ttm_days"""
@@ -298,24 +420,24 @@ ORDER BY ttm_days"""
 # subqueries; targets are embedded at build time. The deprecated segment is
 # hidden by default via a native filter.
 FEATURE_STACK_DATASET = "feature_target_stack"
-STATUS_ENUM = ["deprecated", "prod", "rnd", "uat"]
 
 
-def build_feature_stack_sql(feat_target, fv_target):
+def build_feature_stack_sql(feat_target, fv_target, tag, status_values):
     """Per population: an 'actual' bar stacked by asset value, plus
     a separate 'target' bar."""
     def rows(status_sql, alias, metric, target):
         def cnt(cond):
             return f"(SELECT COUNT(*) FROM ({status_sql}) {alias} WHERE {cond})"
         col = f"{alias}.{'fg_status' if alias == 'fs' else 'fv_status'}"
-        out = [(metric, "actual", s, cnt(f"{col} = '{s}'")) for s in STATUS_ENUM]
+        out = [(metric, "actual", v, cnt(f"{col} = {sql_str(v)}"))
+               for v in status_values]
         # untagged: no asset tag at all (LEFT JOIN leaves it NULL).
         out.append((metric, "actual", "untagged", cnt(f"{col} IS NULL")))
         out.append((metric, "target", "target", str(int(target))))
         return out
 
-    all_rows = (rows(FEATURE_STATUS_SQL, "fs", "features", feat_target)
-                + rows(FV_FEATURE_STATUS_SQL, "vs", "Feature Views", fv_target))
+    all_rows = (rows(feature_status_sql(tag), "fs", "features", feat_target)
+                + rows(fv_feature_status_sql(tag), "vs", "Feature Views", fv_target))
     union = "\n    UNION ALL\n".join(
         f"    SELECT '{metric}' AS metric, '{bar}' AS bar,"
         f" '{seg}' AS segment, ({val}) AS value"
@@ -329,20 +451,13 @@ ANALYTICS_CONNECTION = "hopsworks_analytics"
 
 
 def find_mysql_db_id(api):
-    """The analytics connection, which the backend names '<connector>__<superset user>'.
+    """The analytics connection, resolved the same way every other builder resolves it.
 
-    Selecting on the mysql backend alone is not enough: a project with the online feature store also has a
-    MySQL connection, so the first match can silently be the wrong database and every chart then reads it.
+    This had its own prefix-only copy of the lookup, which preferred whichever connection came back
+    first. On a cluster still carrying the per-user connections that is routinely somebody's personal
+    one, so the shared connection existed and these dashboards were built somewhere else anyway.
     """
-    mysql_dbs = [db for db in api.list_databases()["result"]
-                 if (db.get("backend") or "").lower() == "mysql"]
-    for db in mysql_dbs:
-        if (db.get("database_name") or "").startswith(ANALYTICS_CONNECTION):
-            return db["id"], db.get("database_name")
-    raise RuntimeError(
-        f"No Superset connection named {ANALYTICS_CONNECTION}* found. "
-        f"MySQL connections present: {[db.get('database_name') for db in mysql_dbs]}"
-    )
+    return resolve_analytics_database(api)
 
 
 def run_sql(api, db_id, sql):
@@ -356,40 +471,93 @@ def run_sql(api, db_id, sql):
 
 
 def load_targets(project):
-    """Read OKR targets from the `okrs` feature group -> {metric: target}."""
+    """Read OKR targets from the `okrs` feature group -> {canonical metric: target}.
+
+    Names are resolved through TARGET_ALIASES and then checked against SUPPORTED_METRICS.
+    An unrecognised name stops the build instead of becoming a zero actual, which
+    is what let a configured target of 10 render as 0 with NULL attainment.
+    """
     fs = project.get_feature_store()
     df = fs.get_feature_group(OKRS_FG, version=OKRS_FG_VERSION).read()
-    targets = {str(r["target"]): int(r["value"]) for _, r in df.iterrows()}
+    targets = {}
+    unknown = []
+    for _, r in df.iterrows():
+        name = TARGET_ALIASES.get(str(r["target"]), str(r["target"]))
+        if name not in SUPPORTED_METRICS:
+            unknown.append(str(r["target"]))
+            continue
+        targets[name] = int(r["value"])
+    if unknown:
+        sys.exit(
+            f"Unsupported OKR target(s) in the '{OKRS_FG}' feature group: "
+            + ", ".join(sorted(set(unknown)))
+            + ".\nSupported: " + ", ".join(sorted(SUPPORTED_METRICS))
+            + ".\nFix the row or add the metric to actual_sql(); it cannot be counted as it stands."
+        )
     if not targets:
         sys.exit(f"No targets found in the '{OKRS_FG}' feature group")
     return targets
 
 
-def build_dup_features_counts_sql(project):
-    """feature_name -> times-suspected-as-duplicate, embedded as a literal SELECT.
+def read_duplicate_scan(project):
+    """The latest duplicate-features scan: ``(counts, scanned_at, state)``.
 
-    Read the `suspected_duplicate_features` feature group via the Hopsworks
-    Feature Query Service (reliable in-process) and embed the per-feature counts.
-    The FG's offline DELTA table is NOT reliably queryable through Superset's
-    Trino connection — Trino caches the table's split/file manifest for the
-    reused path and keeps referencing parquet files that each rewrite deletes
-    (COUNT works off delta stats, but a GROUP BY scan hits the dead file). So we
-    aggregate here at build time; re-run this builder to refresh the chart after
-    the nightly detection job updates the FG. Only features actually flagged
-    appear, so features with zero suspected duplicates are naturally excluded.
+    ``counts`` is feature_name -> times suspected. ``scanned_at`` is the ISO time the detector
+    recorded in the feature group's description, or None. ``state`` is one of ``"ok"`` (a scan
+    was read, possibly with zero findings), ``"absent"`` (the detector has never published) or
+    ``"unreadable"`` (a version exists but could not be read). The three are kept apart because
+    the dashboard used to render all of them as an empty chart, so a broken read was
+    indistinguishable from a clean bill of health.
+
+    Reads the newest version rather than a fixed one: the detector publishes each scan as a new
+    version and retires the older ones only after the new one is committed, so the newest is
+    always a complete result and an in-flight failure never removes the last good one.
     """
     fs = project.get_feature_store()
+    try:
+        versions = fs.get_feature_groups(DUP_FEATURES_FG)
+    except Exception as e:
+        print(f"  ! could not list '{DUP_FEATURES_FG}' ({e}).")
+        return {}, None, "absent"
+    if not versions:
+        return {}, None, "absent"
+    latest = max(versions, key=lambda fg: fg.version)
+    scanned_at, findings = None, None
+    for token in (latest.description or "").split():
+        if token.startswith(DUP_SCANNED_AT_PREFIX):
+            scanned_at = token[len(DUP_SCANNED_AT_PREFIX):]
+        elif token.startswith(DUP_FINDINGS_PREFIX):
+            try:
+                findings = int(token[len(DUP_FINDINGS_PREFIX):])
+            except ValueError:
+                findings = None
+    if findings == 0:
+        # A clean scan. Not read, deliberately: an empty DELTA feature group has a schema and no
+        # data files, and reading it fails with "no active delta files", which would make a clean
+        # bill of health indistinguishable from a broken read. The detector recorded the count so
+        # this does not have to guess from an error message.
+        return {}, scanned_at, "ok"
     counts = {}
     try:
-        df = fs.get_feature_group(DUP_FEATURES_FG, version=1) \
-               .select(["feature_name"]).read()
-        for name, c in df["feature_name"].value_counts().items():
-            label = "" if name is None else str(name)
-            if label:
-                counts[label] = int(c)
+        df = latest.select(["feature_name"]).read()
     except Exception as e:
-        print(f"  ! could not read '{DUP_FEATURES_FG}' ({e}); chart left empty.")
+        print(f"  ! could not read '{DUP_FEATURES_FG}' v{latest.version} ({e}).")
+        return {}, scanned_at, "unreadable"
+    for name, c in df["feature_name"].value_counts().items():
+        label = "" if name is None else str(name)
+        if label:
+            counts[label] = int(c)
+    return counts, scanned_at, "ok"
 
+
+def build_dup_features_counts_sql(counts):
+    """feature_name -> times-suspected-as-duplicate, embedded as a literal SELECT.
+
+    Embedded at build time rather than queried live: the FG's offline DELTA table is not reliably
+    queryable through Superset's Trino connection, which caches the split manifest for the reused
+    path and keeps referencing parquet files each rewrite deletes. Only features actually flagged
+    appear, so features with zero suspected duplicates are naturally excluded.
+    """
     if not counts:
         return ("SELECT CAST(NULL AS CHAR) AS feature_name, "
                 "0 AS times_suspected WHERE 1 = 0")
@@ -404,11 +572,17 @@ def build_dup_features_counts_sql(project):
             "WHERE times_suspected > 0 ORDER BY times_suspected DESC")
 
 
-def build_sql(targets):
-    """UNION one row per OKR: metric, embedded target, live MySQL actual."""
+def build_sql(targets, tag):
+    """UNION one row per OKR: metric, embedded target, live MySQL actual.
+
+    `tag` is the resolved lifecycle tag; the deployment actuals filter on its prod status.
+    """
+    actuals = actual_sql(tag)
     rows = []
     for metric, target in targets.items():
-        actual = ACTUAL_SQL.get(metric, "0")
+        # Unconditional: load_targets rejects any name without an entry, so a
+        # KeyError here is a bug in this file rather than bad customer data.
+        actual = actuals[metric]
         esc = metric.replace("'", "''")
         rows.append(f"    SELECT '{esc}' AS metric, {int(target)} AS target, "
                     f"({actual}) AS actual")
@@ -422,37 +596,6 @@ def build_sql(targets):
 FROM (
 {union}
 ) t"""
-
-
-def ensure_dataset(api, db_id, name, sql):
-    page, existing = 0, None
-    while True:
-        j = api._request("GET", f"/api/v1/dataset/?q=(page:{page},page_size:100)")
-        batch = j.get("result", [])
-        for ds in batch:
-            if ds.get("table_name") == name and ds.get("schema") == SCHEMA:
-                existing = ds
-                break
-        if existing or len(batch) < 100:
-            break
-        page += 1
-
-    if existing:
-        ds_id = existing["id"]
-        api.update_dataset(ds_id, sql=sql)
-        print(f"Updated existing dataset id={ds_id}")
-    else:
-        ds_id = api.create_dataset(
-            database_id=db_id, table_name=name, schema=SCHEMA, sql=sql)["id"]
-        print(f"Created dataset id={ds_id}")
-
-    # Re-introspect columns (Superset does not do this on a virtual dataset's
-    # SQL change) and disable result caching so the live counts stay fresh.
-    api._request("PUT", f"/api/v1/dataset/{ds_id}/refresh")
-    api.update_dataset(ds_id, cache_timeout=0)
-    cols = api.get_dataset(ds_id).get("result", {}).get("columns", [])
-    print(f"  synced {len(cols)} columns; cache disabled (cache_timeout=0)")
-    return ds_id
 
 
 def list_all(api, resource):
@@ -525,6 +668,9 @@ DUP_FEATURES_CHART = f"{CHART_PREFIX}Suspected Duplicate Features"
 # The feature group the nightly duplicate-detection job (de)populates.
 DUP_FEATURES_FG = "suspected_duplicate_features"
 DUP_FEATURES_DATASET = "suspected_duplicate_feature_counts"
+# Token the detector writes into the feature group description; see detect_duplicate_features.
+DUP_SCANNED_AT_PREFIX = "scanned_at="
+DUP_FINDINGS_PREFIX = "findings="
 
 
 def chart_specs(targets):
@@ -549,7 +695,7 @@ def chart_specs(targets):
     # Position 3: Production Model Progression — number of feature views tagged
     #     asset='prod', against the models OKR target. From the fv_status dataset.
     specs.append(attainment_table(
-        PROD_MODEL_CHART, "COUNT(*)", str(int(targets.get("models", 0))),
+        PROD_MODEL_CHART, "COUNT(*)", str(int(targets.get("feature views (models)", 0))),
         sql_filter("fv_status = 'prod'")))
 
     # 3c. Two separate stacked charts (kept apart so the very different target
@@ -718,16 +864,42 @@ def chart_specs(targets):
 
 
 def replace_chart(api, slice_name, viz_type, dataset_id, params):
-    for c in list_all(api, "chart"):
-        if c.get("slice_name") == slice_name:
-            api.delete_chart(c["id"])
-    return api.create_chart(
-        slice_name=slice_name, viz_type=viz_type, datasource_id=dataset_id,
-        params=json.dumps(params))["id"]
+    """Reconcile a chart by name, updating in place where one already exists.
+
+    This deleted every chart with a matching title before creating a replacement. A failure
+    between the two left the published dashboard missing charts; a success changed the chart id
+    and so dropped it out of any other dashboard reusing it; and matching on title alone gave no
+    ownership boundary against a chart somebody else had named the same. Ownership here is the
+    dataset: our title on our dataset is ours to update.
+    """
+    named = [c for c in list_all(api, "chart") if c.get("slice_name") == slice_name]
+    ours = [c for c in named if c.get("datasource_id") == dataset_id]
+    if not ours and named:
+        raise RuntimeError(
+            f"A chart named '{slice_name}' already exists on datasource(s) "
+            f"{[c.get('datasource_id') for c in named]}, not on this dashboard's dataset "
+            f"{dataset_id}. Refusing to overwrite a chart that may not be ours; rename or remove "
+            f"it and re-run.")
+    body = dict(slice_name=slice_name, viz_type=viz_type, datasource_id=dataset_id,
+                datasource_type="table", params=json.dumps(params))
+    if ours:
+        chart_id = ours[0]["id"]
+        api.update_chart(chart_id, **body)
+    else:
+        chart_id = api.create_chart(**body)["id"]
+    for dup in ours[1:]:
+        api.delete_chart(dup["id"])
+    return chart_id
 
 
-def build_position_json(charts, title):
-    """charts: list of {id, name, width, height}. Greedily pack rows to 12 cols."""
+def build_position_json(charts, title, note=None):
+    """charts: list of {id, name, width, height}. Greedily pack rows to 12 cols.
+
+    ``note`` is markdown placed above the first row. This dashboard embeds targets and
+    duplicate-feature counts as SQL literals taken when the builder last ran, so the note is
+    where the snapshot's age is stated: nothing else on the page distinguishes a number read
+    a minute ago from one read last quarter.
+    """
     layout = {
         "DASHBOARD_VERSION_KEY": "v2",
         "ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": ["GRID_ID"]},
@@ -747,6 +919,15 @@ def build_position_json(charts, title):
                           "meta": {"background": "BACKGROUND_TRANSPARENT"}}
         layout["GRID_ID"]["children"].append(row_id)
 
+    if note:
+        new_row()
+        layout["MARKDOWN-note"] = {
+            "type": "MARKDOWN", "id": "MARKDOWN-note", "children": [],
+            "parents": ["ROOT_ID", "GRID_ID", row_id],
+            "meta": {"width": 12, "height": 6, "code": note},
+        }
+        layout[row_id]["children"].append("MARKDOWN-note")
+
     new_row()
     for ch in charts:
         w = min(ch["width"], 12)
@@ -762,7 +943,7 @@ def build_position_json(charts, title):
     return json.dumps(layout)
 
 
-def stack_segment_filter_metadata(ds_id, stack_chart_ids, all_chart_ids):
+def stack_segment_filter_metadata(ds_id, stack_chart_ids, all_chart_ids, status_values):
     """Native multi-select on the stacked-bar 'segment', scoped to the two
     stacked charts (features + feature views) only.
 
@@ -775,30 +956,58 @@ def stack_segment_filter_metadata(ds_id, stack_chart_ids, all_chart_ids):
     excluded = [cid for cid in all_chart_ids if cid not in keep]
     # All segment values except 'deprecated' (the default selection). 'target' is
     # the separate target bar's series and stays visible by default.
-    default_vals = [s for s in STATUS_ENUM if s != "deprecated"] + ["untagged", "target"]
-    return json.dumps({
-        "native_filter_configuration": [{
-            "id": "NATIVE_FILTER-stack_segment",
-            "name": "Status segments (deprecated off by default)",
-            "filterType": "filter_select", "type": "NATIVE_FILTER",
-            "targets": [{"datasetId": ds_id, "column": {"name": "segment"}}],
-            "controlValues": {"multiSelect": True, "enableEmptyFilter": False,
-                              "defaultToFirstItem": False, "inverseSelection": False,
-                              "searchAllOptions": False},
-            "scope": {"rootPath": ["ROOT_ID"], "excluded": excluded},
-            "defaultDataMask": {
-                "filterState": {"value": default_vals},
-                "extraFormData": {"filters": [
-                    {"col": "segment", "op": "IN", "val": default_vals}]},
-            },
-            "cascadeParentIds": [],
-        }],
-        "cross_filters_enabled": False,
-    })
+    default_vals = ([v for v in status_values if v != TERMINAL_STATUS]
+                    + ["untagged", "target"])
+    return {
+        "id": "NATIVE_FILTER-stack_segment",
+        "name": "Status segments (deprecated off by default)",
+        "filterType": "filter_select", "type": "NATIVE_FILTER",
+        "targets": [{"datasetId": ds_id, "column": {"name": "segment"}}],
+        "controlValues": {"multiSelect": True, "enableEmptyFilter": False,
+                          "defaultToFirstItem": False, "inverseSelection": False,
+                          "searchAllOptions": False},
+        "scope": {"rootPath": ["ROOT_ID"], "excluded": excluded},
+        "defaultDataMask": {
+            "filterState": {"value": default_vals},
+            "extraFormData": {"filters": [
+                {"col": "segment", "op": "IN", "val": default_vals}]},
+        },
+        "cascadeParentIds": [],
+    }
 
 
-def ensure_dashboard(api, title, charts, json_metadata=None):
-    position_json = build_position_json(charts, title)
+def project_filter_metadata(dataset_id, scoped_chart_ids, all_chart_ids):
+    """Native multi-select on project, scoped to the charts whose datasets carry one.
+
+    Most of this dashboard cannot be sliced by project and it is not an oversight. Every
+    KPI panel and the stacked bar compare a live count against an OKR *target*, and the
+    targets in the `okrs` feature group are cluster-wide: filtering the actual while the
+    target stays whole turns "142 of 500" into a percentage that means nothing. Those
+    charts are excluded, so selecting a project leaves them reading what they always read.
+
+    The charts that are in scope are the ones that count things rather than compare them
+    to a target -- feature popularity, model time-to-market, the lifecycle funnel -- where
+    "in this project" is a question with an answer.
+    """
+    keep = set(scoped_chart_ids)
+    excluded = [cid for cid in all_chart_ids if cid not in keep]
+    return {
+        "id": "NATIVE_FILTER-project",
+        "name": "Project",
+        "filterType": "filter_select",
+        "type": "NATIVE_FILTER",
+        "targets": [{"datasetId": dataset_id, "column": {"name": "project_name"}}],
+        "controlValues": {"multiSelect": True, "enableEmptyFilter": False,
+                          "defaultToFirstItem": False, "inverseSelection": False,
+                          "searchAllOptions": False},
+        "scope": {"rootPath": ["ROOT_ID"], "excluded": excluded},
+        "defaultDataMask": {"filterState": {}, "extraFormData": {}},
+        "cascadeParentIds": [],
+    }
+
+
+def ensure_dashboard(api, title, charts, json_metadata=None, note=None):
+    position_json = build_position_json(charts, title, note)
     dash_id = next((d["id"] for d in list_all(api, "dashboard")
                     if d.get("dashboard_title") == title), None)
     kwargs = {"dashboard_title": title, "published": True,
@@ -811,24 +1020,44 @@ def ensure_dashboard(api, title, charts, json_metadata=None):
     else:
         api.update_dashboard(dash_id, **kwargs)
         print(f"Updated dashboard id={dash_id}")
-    for ch in charts:
-        api.update_chart(ch["id"], dashboards=[dash_id])
+    attach_charts(api, dash_id, [ch["id"] for ch in charts])
     return dash_id
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser.add_argument(
+        "--tag",
+        help="lifecycle tag schema carrying the status field; resolved from the cluster "
+             "when omitted (see superset.LIFECYCLE_TAG_ORDER)",
+    )
+    args = parser.parse_args()
+
     project = hopsworks.login()
     api = project.get_superset_api()
 
     db_id, db_name = find_mysql_db_id(api)
     print(f"hopsworks_analytics connection: id={db_id} ({db_name})\n")
 
+    # Which tag schema carries the lifecycle status. Hardcoding 'asset' meant every status
+    # chart here rendered empty on a cluster that names it anything else, with no error:
+    # a tag name that does not exist is a join that matches nothing, not a failure.
+    tag = resolve_lifecycle_tag(lambda sql: run_sql(api, db_id, sql), args.tag)
+    if tag is None:
+        sys.exit(
+            "No lifecycle tag schema on this cluster, so every status-based chart would "
+            "be empty. Run mount_hopsworks_db.py to create 'asset_lifecycle', or pass "
+            "--tag."
+        )
+    status_values = lifecycle_status_values(lambda sql: run_sql(api, db_id, sql), tag)
+    print(f"Lifecycle tag: {tag!r} -> {', '.join(status_values)}\n")
+
     targets = load_targets(project)
     print("OKR targets (from the okrs feature group):")
     for metric, target in targets.items():
         print(f"  {metric}: {target}")
 
-    sql = build_sql(targets)
+    sql = build_sql(targets, tag)
     print("\nGenerated OKR-progress SQL:\n")
     print(sql)
 
@@ -843,26 +1072,26 @@ def main():
 
     # Feature-grain dataset (one row per feature + its asset value)
     # backing the Active / Feature OKR Progression KPI panels.
-    feat_ds_id = ensure_dataset(api, db_id, FEATURE_STATUS_DATASET, FEATURE_STATUS_SQL)
+    feat_ds_id = ensure_dataset(api, db_id, FEATURE_STATUS_DATASET, feature_status_sql(tag))
     print(f"Dataset '{FEATURE_STATUS_DATASET}' ready (id={feat_ds_id}).")
 
-    # Stacked dataset: features (vs features target) + Feature Views (vs models
-    # target), each split by asset with a gap-to-target segment.
+    # Stacked dataset: features (vs features target) + Feature Views (vs the
+    # feature-views target), each split by asset with a gap-to-target segment.
     feat_target = int(targets.get("features", 0))
-    fv_target = int(targets.get("models", 0))
+    fv_target = int(targets.get("feature views (models)", 0))
     stack_ds_id = ensure_dataset(
         api, db_id, FEATURE_STACK_DATASET,
-        build_feature_stack_sql(feat_target, fv_target))
+        build_feature_stack_sql(feat_target, fv_target, tag, status_values))
     print(f"Dataset '{FEATURE_STACK_DATASET}' ready (id={stack_ds_id}).")
 
     # Daily feature-reuse time series (features added to prod-tagged feature views).
     reuse_ds_id = ensure_dataset(
-        api, db_id, FEATURE_REUSE_DATASET, FEATURE_REUSE_SQL)
+        api, db_id, FEATURE_REUSE_DATASET, feature_reuse_sql(tag))
     print(f"Dataset '{FEATURE_REUSE_DATASET}' ready (id={reuse_ds_id}).")
 
     # Feature-group lifecycle funnel dataset (feature counts by asset status).
     fg_funnel_ds_id = ensure_dataset(
-        api, db_id, FG_FUNNEL_DATASET, build_fg_funnel_sql())
+        api, db_id, FG_FUNNEL_DATASET, build_fg_funnel_sql(tag, status_values))
     print(f"Dataset '{FG_FUNNEL_DATASET}' ready (id={fg_funnel_ds_id}).")
 
     # Feature popularity dataset (distinct feature-view usage per feature).
@@ -871,7 +1100,7 @@ def main():
     print(f"Dataset '{FEATURE_POPULARITY_DATASET}' ready (id={popularity_ds_id}).")
 
     # Feature-view status dataset (one row per FV + its asset status).
-    fv_status_ds_id = ensure_dataset(api, db_id, FV_STATUS_DATASET, FV_STATUS_SQL)
+    fv_status_ds_id = ensure_dataset(api, db_id, FV_STATUS_DATASET, fv_status_sql(tag))
     print(f"Dataset '{FV_STATUS_DATASET}' ready (id={fv_status_ds_id}).")
 
     # Model time-to-market dataset (days from FV created to model created).
@@ -879,8 +1108,9 @@ def main():
     print(f"Dataset '{MODEL_TTM_DATASET}' ready (id={ttm_ds_id}).")
 
     # Suspected-duplicate-feature counts, embedded from the FG (read in-process).
+    dup_counts, dup_scanned_at, dup_state = read_duplicate_scan(project)
     dup_ds_id = ensure_dataset(api, db_id, DUP_FEATURES_DATASET,
-                               build_dup_features_counts_sql(project))
+                               build_dup_features_counts_sql(dup_counts))
     print(f"Dataset '{DUP_FEATURES_DATASET}' ready (id={dup_ds_id}).")
 
     # Delete charts retired from the dashboard so they don't linger in Superset.
@@ -895,7 +1125,9 @@ def main():
             print(f"Deleted retired chart '{name}' (id={c['id']})")
 
     print("\nCreating charts:")
-    charts, stack_chart_ids = [], []
+    charts, stack_chart_ids, project_chart_ids = [], [], []
+    # The charts whose datasets carry project_name; see project_filter_metadata.
+    project_scoped = {MOST_POPULAR_CHART, MODEL_TTM_CHART, FG_FUNNEL_CHART}
     for slice_name, viz_type, params, width, height in chart_specs(targets):
         if slice_name == FEATURE_STACK_CHART:
             chart_ds = stack_ds_id
@@ -918,13 +1150,43 @@ def main():
         cid = replace_chart(api, slice_name, viz_type, chart_ds, params)
         if slice_name == FEATURE_STACK_CHART:
             stack_chart_ids.append(cid)
+        if slice_name in project_scoped:
+            project_chart_ids.append(cid)
         charts.append({"id": cid, "name": slice_name,
                        "width": width, "height": height})
         print(f"  [{viz_type}] {slice_name} -> id={cid}")
 
-    json_metadata = stack_segment_filter_metadata(
-        stack_ds_id, stack_chart_ids, [c["id"] for c in charts])
-    dash_id = ensure_dashboard(api, DASHBOARD_TITLE, charts, json_metadata)
+    all_chart_ids = [c["id"] for c in charts]
+    json_metadata = json.dumps({
+        "native_filter_configuration": [
+            stack_segment_filter_metadata(stack_ds_id, stack_chart_ids, all_chart_ids,
+                                          status_values),
+            project_filter_metadata(popularity_ds_id, project_chart_ids, all_chart_ids),
+        ],
+        "cross_filters_enabled": False,
+    })
+    # The targets and the duplicate-feature counts on this page are SQL literals, fixed when this
+    # builder runs. Editing the okrs feature group or re-running the duplicate detector does not
+    # change them, and neither does the wizard's Refresh Dashboard Now, which rebuilds the tag
+    # dashboards only. Stating when they were taken is what makes a stale number recognisable;
+    # refresh_dashboards.py re-runs this builder alongside the tag datasets.
+    taken = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # The scan time is the detector's, not this build's: the two are separate events and a fresh
+    # build of a month-old scan must not read as a month-old finding refreshed today.
+    if dup_state == "ok" and dup_scanned_at:
+        dup_line = f"Duplicate-feature findings come from the scan at {dup_scanned_at}."
+    elif dup_state == "ok":
+        dup_line = "Duplicate-feature findings come from the latest scan (time not recorded)."
+    elif dup_state == "absent":
+        dup_line = "**No duplicate-feature scan has been published yet**; that chart is empty."
+    else:
+        dup_line = ("**The latest duplicate-feature scan could not be read**; that chart is "
+                    "empty and does not mean there are none.")
+    note = (f"**OKR targets are a snapshot taken {taken}.** {dup_line} "
+            "Every other number on this page is read live. Re-run "
+            "`refresh_dashboards.py` after changing the `okrs` feature group or running the "
+            "duplicate detector.")
+    dash_id = ensure_dashboard(api, DASHBOARD_TITLE, charts, json_metadata, note=note)
     print(f"\nDashboard '{DASHBOARD_TITLE}' ready (id={dash_id}).")
     print(f"Open it: {host}/hopsworks-api/superset/superset/dashboard/{dash_id}/")
 

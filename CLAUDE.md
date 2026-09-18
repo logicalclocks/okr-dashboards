@@ -1,6 +1,24 @@
 This repo is used to build superset dashboards for Hopsworks. You should pick the most appropriate Chart type based on the dataset and the distribution/cardinality of values.
 
-The first task is to mount all the tables in the mysql 'hopsworks' database as external feature groups. You do this by running 'mount_hopsworks_db.py'. AskUserQuestion if they want to mount the hopsworks database tables if they have not already been mounted.
+## Read the user's answers first
+
+The questions this setup needs answered live in `okrs.md` in the user's home directory
+(`$HOPSFS_USER_HOME_DIR`, falling back to `$HOME`). `okrs.sh` in this repo asks them in the Terminal
+and writes that file, and the Setup Analytics wizard runs it before it launches you. Read `okrs.md`
+before doing anything else. Do not ask the questions yourself and do not run `okrs.sh`: it needs an
+interactive terminal, which a coding agent does not have. If the file is missing, tell the user to
+run `okrs.sh` in the Terminal and stop.
+
+`okrs.md` carries a table of targets and three yes/no setup choices. The targets are the OKR values
+for the current year for `features`, `feature views (models)`, `model deployments` and
+`agent deployments`. A value of 0 means the user does not track that target: create no OKR row for
+it.
+
+## Tasks
+
+The first task, when `mount_hopsworks_db` is `yes`, is to mount all the tables in the mysql
+'hopsworks' database as external feature groups by running 'mount_hopsworks_db.py'. Skip it if
+they are already mounted.
 
 That same run also registers the 'asset_lifecycle' tag schema if it is not already there: status (deprecated | dev | qa | uat | prod) and owner. It is created with history archiving ON, which is what lets create_lifecycle_dashboard.py chart how long assets sit in each stage. Archiving cannot be added retroactively: switching it on later backfills a baseline rather than recovering the transitions that happened while it was off, so creation is the only moment that loses nothing.
 
@@ -8,18 +26,7 @@ An existing schema is left exactly as it is, archive flag included, because re-r
 
 Registering a tag schema is admin-only, which is fine here: this wizard is admin-only too.
 
-The second task is to create a new feature group called okrs that will store the user's OKRs that will be shown in an 'executive dashboard'. If the okrs feature group has not been created and populated, then do the following:
-
-AskUserQuestion: 
-The following are some questions about your OKRs (KPIs) for your organization for the curent year for AI assets in Hopsworks.
- - What is your target for the total number of production features (e.g., 1000)?
-AskUserQuestion: 
- - What is your target for the total number of production models (e.g., 10)?
-AskUserQuestion: 
-
-If the user answers '0' or 'none/no', then do not include that value as an OKR row.
-
-Use the answers to create the okrs feature group with 'target' and 'value' columns. Create a DataFrame with the following data: "features/feature views (models)/model deployments/agent deployments" as the 'target' entries and the 'value' entries being the numerical answer provided by the user.
+The second task is to create a new feature group called okrs that will store the user's OKRs that will be shown in an 'executive dashboard'. If the okrs feature group has not been created and populated, build it from the targets table in `okrs.md`: a DataFrame with 'target' and 'value' columns, one row per target whose value is not 0, with the 'target' entries being exactly the names in the table ("features", "feature views (models)", "model deployments", "agent deployments") and the 'value' entries the numbers the user gave.
 
 We will then create a schematized tag called 'asset' if it doesn't exist. 
 Here is the json for the 'status' schematized tag:
@@ -54,23 +61,34 @@ Here is the json for the 'status' schematized tag:
 Build the executive dashboard by running 'create_executive_dashboard.py'. This reads the targets from the okrs feature group and pairs each one against its live actual, computed from the real hopsworks metadata tables via the hopsworks_analytics JDBC connection in Superset (no Trino). Re-run it after the OKR targets change to refresh them. Note that when you mount the MySQL tables as feature groups, it can rename columns. You will create the dashboards against the MySQL tables, so use its colun names.
 
 
-Then, you want to
-AskUserQuestion:
-Can we schedule a daily job to update the schematized tags in the system?
-If the user answers yes, create a Python job to run 'create_tag_dataset.py' once/day by default at 04.00. Use 1 CPU and 4 GB of memory in the job.
+Then, when `schedule_daily_tag_job` is `yes`, create a Python job to run 'refresh_dashboards.py' once/day by default at 04.00. Use 1 CPU and 4 GB of memory in the job.
 
-Name that job exactly `update-tag-dataset`. This is a contract, not a preference: the Hopsworks UI's "Refresh Dashboard Now" action looks the job up by that literal name (ANALYTICS_TAG_JOB in hopsworks-front's `src/modules/wizard/Wizard.tsx`). Any other name and the action 404s and tells the user to run Setup Analytics first, which they will already have done.
+Run 'refresh_dashboards.py', not 'create_tag_dataset.py' directly. It runs the tag datasets and then the executive dashboard, which is the set whose numbers are snapshots rather than live reads. The executive dashboard embeds its OKR targets and duplicate-feature counts as SQL literals fixed at build time, so a job that rebuilt only the tag datasets left those reporting whatever they held when the dashboard was first created, however often it ran.
+
+An installation set up before refresh_dashboards.py existed has this job pointing at create_tag_dataset.py. It will report success on every run while the executive targets never change, and the UI cannot tell the two apart because it finds the job by name. Run 'migrate_refresh_job.py' once on such an installation: it uploads the runner and its sibling scripts next to the job's current entry point, switches the entry point, and runs the job once to confirm.
+
+Name that job exactly `update-tag-dataset`. This is a contract, not a preference: the Hopsworks UI's "Refresh Dashboard Now" action looks the job up by that literal name (ANALYTICS_TAG_JOB in hopsworks-front's `src/modules/wizard/Wizard.tsx`). Any other name and the action 404s and tells the user to run Setup Analytics first, which they will already have done. The name is now slightly narrower than what the job does, and it stays as it is because the UI depends on the literal.
 
 
-AskUserQuestion:
-Do you want to create the dashboards now (executive, developer, others)?
+When `create_dashboards_now` is `yes`, create the dashboards (executive, developer, others).
 
-If the user answers yes, then run the python programs to create the dashboards: create_tag_dataset.py, create_executive_dashboard.py, create-analyst-dashboard.py, create_jobs_dashboard.py, create_tag_history_dashboard.py, create_lifecycle_dashboard.py.
+If the user answers yes, then run the python programs to create the dashboards: create_tag_dataset.py, create_executive_dashboard.py, create-analyst-dashboard.py, create_jobs_dashboard.py, create_tag_history_dashboard.py, create_lifecycle_dashboard.py, create_promotion_dashboard.py.
 
 'create_tag_history_dashboard.py' builds the "Tag Lifecycle" dashboard over hopsworks.tag_history: how long artifacts sit in each tag value, whether that is getting slower, what is in each state now, and what is currently stuck. It registers a `tag_history_intervals` virtual dataset that derives added_on/removed_at from the append-only event log with a window function, and charts that. It only has data for tag schemas with "Archive tag history" turned on (Settings -> Schematised tags in the Hopsworks UI); a schema without it records nothing, and the script says so rather than building empty charts.
 
 'create-analyst-dashboard.py' builds the analyst dashboard covering feature/feature-group counts and growth over time, with native filter "selection boxes" (Tag, Tag value, Feature group kind) that let you slice/group the feature data by tag values mirrored from the 'feature_store_tags_by_value' virtual dataset. It reuses the shared Superset helpers in create_tag_dataset.py, is idempotent, and disables result caching — re-run it anytime to refresh. It supersedes the removed 'feature_group_dashboard.py' and 'feature_usage_dashboard.py'; do not try to run those.
 
+It builds one of two dashboards, chosen by `--variant`. They differ in the weekly feature-growth chart alone: `stacked` (the default, "Analyst/Data Scientist Dashboard") explodes a series per tag value so the whole breakdown is on screen at once, and `filtered` ("Analyst · Tag-Filtered Features") draws one bar per week for the Tag value selection box to narrow, which is the only readable form once there are more than a handful of values. Each keeps its own dashboard title and chart-name prefix, so building one never disturbs the other. These were two 450-line files identical but for one `groupby` list; the copy is gone, so a fix to the analyst dashboard now only has to be made once. 'create-analyst-dashboard-tagfilter.py' no longer exists.
+
+
+No builder hardcodes a lifecycle tag name any more. `superset.resolve_lifecycle_tag` picks the
+first schema the cluster actually has from `asset_lifecycle`, `asset`, `sdlc`, `lifecycle_status`,
+and every builder takes `--tag` to override it. `superset.lifecycle_status_values` then reads that
+schema's `status` enum for the stage list. Both were hardcoded before and both failed the same
+silent way: the analyst dashboard charted `sdlc`, which exists on no current cluster, and the
+executive dashboard's stage list omitted `dev`, hiding 81 features that were in it. A tag name or
+a stage value that does not exist is not an error to Superset. It is a join that matches nothing,
+and it renders as an empty chart with nothing to say why.
 
 'superset.py' is the library the dashboard builders share: connecting to the analytics database,
 registering a virtual dataset, (re)creating charts and laying them out. It has no dashboard of its
@@ -108,3 +126,57 @@ demo/test aid, not part of the setup flow: run it against a populated project
 (`python seed_asset_lifecycle.py --project <name>`) when you need data. It turns archiving on
 BEFORE attaching anything, because turning it on afterwards backfills each attachment at its attach
 time and records no transitions.
+
+
+'create_promotion_dashboard.py' builds the "Asset Promotion Time" dashboard: how long assets take
+to travel dev -> uat -> prod. It answers a different question from the Asset Lifecycle dashboard
+and derives its data differently. That one measures dwell, how long an asset sits in one stage,
+one row per interval. This one measures the journey: per asset, the time between first entering
+one stage and first entering the next, so `dev -> prod` is a single number however many stages or
+detours it passed through. Average, longest, distribution, how many complete each step, the trend
+by week, and the slowest journeys.
+
+The stages come from the tag schema's own `status` enum, minus `deprecated` (a terminal state, not
+a step towards production). `--stages` overrides them. They used to be hardcoded to
+`dev,uat,prod`, which skipped `qa` on the schema that has it and measured a transition no asset
+makes.
+
+Stage entry is the FIRST entry, not the last: an asset demoted from prod and promoted again has
+entered prod twice, and taking the later one would report the round trip as its time to
+production. Only forward journeys count, since a rollback would otherwise contribute a negative
+duration and quietly drag every average down.
+
+'seed_promotion_history.py' is a demo aid for that dashboard, not part of the setup flow. Real
+promotions through seed_asset_lifecycle.py happen seconds apart, because it drives the REST API
+and the backend timestamps each write as it happens, which leaves every duration at zero and the
+charts with nothing to show. This writes backdated history rows directly so they do. It needs a
+privileged MySQL account (the analytics read-only user cannot write), and it DELETES the tag's
+existing history first so the result is one coherent set of journeys rather than backdated rows
+interleaved with real ones. The rows it writes carry a correctly computed event_id, so the unique
+key and the interval derivation treat them exactly like rows the backend wrote.
+
+Executing it requires `--demo-cluster`. The first thing it does is delete every event for the tag,
+and nothing about the invocation distinguishes a demo cluster from one whose history someone is
+reporting on. `--emit-sql` prints the statements without running them and needs no confirmation.
+
+Because seeded rows are indistinguishable by design, both lifecycle dashboards carry a note saying
+what their numbers are derived from and that a `seed_promotion_history.py` run would make them
+synthetic. A duration like "37 days to production" gets quoted in meetings long after anyone
+remembers which cluster it came from.
+
+
+Every dashboard here carries a **Project** selection box, so any chart can be sliced to one
+project or compared across several. It is a native filter built by `superset.project_filter`,
+scoped to the whole dashboard except charts whose dataset lacks the column: an unscoped filter
+over a column a chart cannot see makes that chart error rather than ignore it.
+
+The Asset Promotion Time dashboard goes further and takes `--series project_name`, which breaks
+the duration bars down by project instead of by asset kind. They answer different questions of the
+same data: asset kind says what is slow, project says who is slow.
+
+The Executive OKR dashboard has a project filter too, but scoped rather than global. It applies to
+the charts that count things (feature popularity, model time-to-market, the lifecycle funnel) and
+is excluded from the ones that compare a count against a target. Targets come from the `okrs`
+feature group and have no project dimension, so filtering the actual while the target stays whole
+turns "142 of 500" into a percentage that means nothing. Those charts keep reading cluster-wide
+whatever is selected.

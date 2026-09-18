@@ -24,13 +24,89 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 SCHEMA = "hopsworks"
 ANALYTICS_CONNECTION = "hopsworks_analytics"
 
 GRID_COLUMNS = 12
 PAGE_SIZE = 100
+
+
+def resolve_analytics_database(api: Any) -> tuple[int, str]:
+    """The analytics connection: ``(id, name)``.
+
+    Exact match on the shared connection first, prefix match second. The backend
+    provisions one connection named exactly ``hopsworks_analytics`` and grants it
+    through a role, but a cluster upgrading from the per-user model still carries
+    ``hopsworks_analytics__<superset user>`` connections alongside it. A prefix
+    match alone therefore picks whichever came back first, which during an upgrade
+    is routinely somebody's personal connection: the dashboards built on it are
+    then unqueryable by every other admin, and retiring that admin's connection
+    breaks them.
+
+    Matching on the mysql backend alone is not enough either: a project with an
+    online feature store has a MySQL connection too.
+    """
+    mysql = [
+        db
+        for db in api.list_databases()["result"]
+        if (db.get("backend") or "").lower() == "mysql"
+    ]
+    for db in mysql:
+        if (db.get("database_name") or "") == ANALYTICS_CONNECTION:
+            return db["id"], db["database_name"]
+    for db in mysql:
+        name = db.get("database_name") or ""
+        if name.startswith(ANALYTICS_CONNECTION):
+            return db["id"], name
+    raise RuntimeError(
+        f"No Superset connection named {ANALYTICS_CONNECTION} found. "
+        f"MySQL connections present: {[db.get('database_name') for db in mysql]}"
+    )
+
+
+def ensure_dataset(api: Any, database_id: int, name: str, statement: str) -> int:
+    """Register or update a virtual dataset on ``database_id``; see ``Superset.ensure_dataset``.
+
+    The executive and jobs builders resolve their connection themselves and used to carry their
+    own copy of this, which matched on name alone and never moved a dataset off the connection it
+    was first built on. One implementation, so the migration happens for every dashboard.
+    """
+    return Superset(api, database_id, ANALYTICS_CONNECTION).ensure_dataset(name, statement)
+
+
+def _list_all(api: Any, resource: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    page = 0
+    while True:
+        batch = api._request(
+            "GET", f"/api/v1/{resource}/?q=(page:{page},page_size:{PAGE_SIZE})"
+        ).get("result", [])
+        items.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return items
+        page += 1
+
+
+def attach_charts(api: Any, dashboard_id: int, chart_ids: Sequence[int]) -> None:
+    """Add each chart to ``dashboard_id`` without detaching it from anything else.
+
+    Superset's chart PUT takes the complete membership list, so
+    ``dashboards=[dashboard_id]`` is a replacement, not an addition: rebuilding one dashboard
+    silently removed every chart it touched from any other dashboard that reused it, even though
+    the chart id itself survived. The current memberships are read once and the destination is
+    unioned in.
+    """
+    wanted = set(chart_ids)
+    current = {
+        c["id"]: {d["id"] for d in (c.get("dashboards") or []) if "id" in d}
+        for c in _list_all(api, "chart")
+        if c.get("id") in wanted
+    }
+    for chart_id in chart_ids:
+        memberships = current.get(chart_id, set()) | {dashboard_id}
+        api.update_chart(chart_id, dashboards=sorted(memberships))
 
 
 @dataclass(frozen=True)
@@ -75,11 +151,21 @@ class Superset:
 
     @classmethod
     def connect(cls, api: Any) -> Superset:
-        """Resolve the analytics connection, which the backend names
-        ``<connector>__<superset user>``.
+        """Resolve the analytics connection.
 
-        Matching on the mysql backend alone is not enough: a project with an
-        online feature store has a MySQL connection too, and picking the first
+        The backend provisions one shared connection named exactly
+        ``hopsworks_analytics``, granted to every cluster admin through a role.
+        Dashboards built on it are therefore queryable by every admin, which
+        they were not when each admin had their own connection.
+
+        The prefix match is the fallback for a cluster that still carries the
+        per-user connections (``<connector>__<superset user>``) from before that
+        change. It is second, not first, because both exist during an upgrade
+        and binding a dataset to somebody's personal connection is exactly the
+        outcome the shared one exists to avoid.
+
+        Matching on the mysql backend alone is not enough either: a project with
+        an online feature store has a MySQL connection too, and picking the first
         match silently points every chart at the wrong database.
         """
         mysql = [
@@ -88,11 +174,14 @@ class Superset:
             if (db.get("backend") or "").lower() == "mysql"
         ]
         for db in mysql:
+            if (db.get("database_name") or "") == ANALYTICS_CONNECTION:
+                return cls(api, db["id"], db["database_name"])
+        for db in mysql:
             name = db.get("database_name") or ""
             if name.startswith(ANALYTICS_CONNECTION):
                 return cls(api, db["id"], name)
         raise RuntimeError(
-            f"No Superset connection named {ANALYTICS_CONNECTION}* found. "
+            f"No Superset connection named {ANALYTICS_CONNECTION} found. "
             f"MySQL connections present: {[db.get('database_name') for db in mysql]}"
         )
 
@@ -141,24 +230,58 @@ class Superset:
 
     # -- datasets ----------------------------------------------------------- #
 
+    @staticmethod
+    def _database_of(dataset: dict) -> int | None:
+        """The id of the connection a listed dataset is bound to (``database.id``)."""
+        return (dataset.get("database") or {}).get("id")
+
     def ensure_dataset(self, name: str, statement: str) -> int:
         """Register or update a virtual dataset, and make sure it reflects the SQL.
 
         Creating fails outright when ``(schema, table_name)`` already exists, so
         this looks first rather than catching.
+
+        A dataset already bound to this connection is updated in place. One bound
+        to a *different* connection is re-pointed at this one, keeping its id so
+        every chart built on it survives. That is the upgrade path off the
+        per-user connections: before, the lookup ignored the database entirely
+        and updated only the SQL, so rebuilding left every dashboard attached to
+        whichever admin first built it. Other admins could not query it, and
+        retiring that admin's connection broke it outright.
+
+        Two datasets under the same name on different connections is not a case
+        this can resolve: picking one would silently orphan the charts on the
+        other. It stops instead.
         """
+        candidates = [
+            ds
+            for ds in self._each("dataset")
+            if ds.get("table_name") == name and ds.get("schema") == SCHEMA
+        ]
         existing = next(
-            (
-                ds
-                for ds in self._each("dataset")
-                if ds.get("table_name") == name and ds.get("schema") == SCHEMA
-            ),
-            None,
+            (ds for ds in candidates if self._database_of(ds) == self.database_id), None
         )
+        strays = [ds for ds in candidates if self._database_of(ds) != self.database_id]
+        if existing is None and len(strays) > 1:
+            raise RuntimeError(
+                f"Dataset '{name}' exists on {len(strays)} connections "
+                f"({[self._database_of(d) for d in strays]}); refusing to guess which one the "
+                f"dashboards use. Delete the unused ones and re-run."
+            )
+        if existing is None and len(strays) == 1:
+            existing = strays[0]
+            self.api.update_dataset(
+                existing["id"], database_id=self.database_id, sql=statement
+            )
+            print(
+                f"Migrated dataset id={existing['id']} from connection "
+                f"{self._database_of(existing)} to the shared connection {self.database_id}"
+            )
+        elif existing:
+            self.api.update_dataset(existing["id"], sql=statement)
+            print(f"Updated existing dataset id={existing['id']}")
         if existing:
             dataset_id = existing["id"]
-            self.api.update_dataset(dataset_id, sql=statement)
-            print(f"Updated existing dataset id={dataset_id}")
         else:
             dataset_id = self.api.create_dataset(
                 database_id=self.database_id,
@@ -169,28 +292,71 @@ class Superset:
             print(f"Created dataset id={dataset_id}")
 
         self.api._request("PUT", f"/api/v1/dataset/{dataset_id}/refresh")
-        self.api.update_dataset(dataset_id, cache_timeout=0)
+        # -1 is Superset's CACHE_DISABLED_TIMEOUT (superset/constants.py): the only value
+        # that bypasses the cache. 0 does not disable caching; in Flask-Caching a timeout of
+        # 0 means never expire, so these datasets were served from a permanent cache while
+        # reporting themselves as uncached. Live counts and elapsed dwell times went stale
+        # indefinitely.
+        self.api.update_dataset(dataset_id, cache_timeout=-1)
         columns = self.api.get_dataset(dataset_id).get("result", {}).get("columns", [])
-        print(f"  synced {len(columns)} columns; cache disabled (cache_timeout=0)")
+        print(f"  synced {len(columns)} columns; cache disabled (cache_timeout=-1)")
         return dataset_id
 
     # -- charts and dashboards ---------------------------------------------- #
 
     def replace_chart(self, spec: ChartSpec, dataset_id: int) -> Chart:
-        """Recreate a chart by name, so re-running is idempotent."""
-        for chart in list(self._each("chart")):
-            if chart.get("slice_name") == spec.name:
-                self.api.delete_chart(chart["id"])
-        chart_id = self.api.create_chart(
-            slice_name=spec.name,
-            viz_type=spec.viz_type,
-            datasource_id=dataset_id,
-            params=json.dumps(spec.params),
-        )["id"]
+        """Reconcile a chart by name, updating in place where one already exists.
+
+        This used to delete every chart with a matching title and then create a
+        replacement. Three things went wrong with that. A failure between the two
+        left the published dashboard missing charts, and the scheduled tag refresh
+        reaches this path. A successful run changed the chart id, which drops the
+        chart out of any other dashboard that reused it. And deleting on title
+        alone has no ownership boundary, so a chart somebody else happened to name
+        the same was destroyed.
+
+        Ownership is the dataset: a chart with our title sitting on our dataset is
+        ours to update. One with our title on a different datasource is not
+        touched, because it cannot be told apart from a user's own chart, and
+        clobbering it is precisely what this is fixing.
+        """
+        named = [c for c in self._each("chart") if c.get("slice_name") == spec.name]
+        ours = [c for c in named if c.get("datasource_id") == dataset_id]
+        if not ours and named:
+            raise RuntimeError(
+                f"A chart named '{spec.name}' already exists on datasource(s) "
+                f"{[c.get('datasource_id') for c in named]}, not on this dashboard's dataset "
+                f"{dataset_id}. Refusing to overwrite a chart that may not be ours; rename or "
+                f"remove it and re-run."
+            )
+        body = {
+            "slice_name": spec.name,
+            "viz_type": spec.viz_type,
+            "datasource_id": dataset_id,
+            "datasource_type": "table",
+            "params": json.dumps(spec.params),
+        }
+        if ours:
+            # In place, so the id survives and every dashboard holding this chart keeps it.
+            chart_id = ours[0]["id"]
+            self.api.update_chart(chart_id, **body)
+        else:
+            chart_id = self.api.create_chart(**body)["id"]
+        # Duplicates under the same title on our own dataset are debris from the
+        # delete-and-create era. Removed only after the survivor is in place.
+        for dup in ours[1:]:
+            self.api.delete_chart(dup["id"])
         return Chart(id=chart_id, spec=spec)
 
-    def ensure_dashboard(self, title: str, charts: Sequence[Chart]) -> int:
-        position = layout_json(charts, title)
+    def ensure_dashboard(
+        self,
+        title: str,
+        charts: Sequence[Chart],
+        filters: Sequence[dict[str, Any]] | None = None,
+        note: str | None = None,
+    ) -> int:
+        position = layout_json(charts, title, note)
+        metadata = dashboard_metadata(filters or [])
         dashboard_id = next(
             (
                 d["id"]
@@ -201,7 +367,8 @@ class Superset:
         )
         if dashboard_id is None:
             dashboard_id = self.api.create_dashboard(
-                dashboard_title=title, published=True, position_json=position
+                dashboard_title=title, published=True, position_json=position,
+                json_metadata=metadata,
             )["id"]
             print(f"Created dashboard id={dashboard_id}")
         else:
@@ -210,11 +377,11 @@ class Superset:
                 dashboard_title=title,
                 published=True,
                 position_json=position,
+                json_metadata=metadata,
             )
             print(f"Updated dashboard id={dashboard_id}")
-        for chart in charts:
-            # Persist the chart -> dashboard link; the layout alone does not.
-            self.api.update_chart(chart.id, dashboards=[dashboard_id])
+        # Persist the chart -> dashboard link; the layout alone does not.
+        attach_charts(self.api, dashboard_id, [chart.id for chart in charts])
         return dashboard_id
 
     def build(
@@ -225,6 +392,8 @@ class Superset:
         statement: str,
         specs: Sequence[ChartSpec],
         host: str | None = None,
+        filters: Callable[[int], Sequence[dict[str, Any]]] | None = None,
+        note: str | None = None,
     ) -> tuple[int, int]:
         """Preview the SQL, register the dataset, recreate the charts, lay them out."""
         print(f"\nGenerated SQL for '{dataset}':\n")
@@ -245,7 +414,11 @@ class Superset:
             charts.append(chart)
             print(f"  [{spec.viz_type}] {spec.name} -> id={chart.id}")
 
-        dashboard_id = self.ensure_dashboard(title, charts)
+        # Filters are built from the dataset id, which only exists once the dataset is registered,
+        # so the caller passes a function rather than the filters themselves.
+        dashboard_id = self.ensure_dashboard(
+            title, charts, filters(dataset_id) if filters else None, note=note
+        )
         print(f"Dashboard '{title}' ready (id={dashboard_id}).")
         if host:
             print(
@@ -254,11 +427,68 @@ class Superset:
         return dataset_id, dashboard_id
 
 
+def native_filter(
+    filter_id: str,
+    name: str,
+    dataset_id: int,
+    column: str,
+    *,
+    multi: bool = True,
+    excluded: Sequence[int] = (),
+) -> dict[str, Any]:
+    """A dashboard selection box over one column.
+
+    Scoped to the whole dashboard except `excluded` chart ids, which is how a filter coexists
+    with charts whose dataset does not have the column: an unscoped filter over a column a chart
+    cannot see makes that chart error rather than ignore it.
+    """
+    return {
+        "id": f"NATIVE_FILTER-{filter_id}",
+        "name": name,
+        "filterType": "filter_select",
+        "type": "NATIVE_FILTER",
+        "targets": [{"datasetId": dataset_id, "column": {"name": column}}],
+        "controlValues": {
+            "multiSelect": multi,
+            "enableEmptyFilter": False,
+            "defaultToFirstItem": False,
+            "inverseSelection": False,
+            "searchAllOptions": False,
+        },
+        "scope": {"rootPath": ["ROOT_ID"], "excluded": list(excluded)},
+        "defaultDataMask": {"filterState": {}, "extraFormData": {}},
+        "cascadeParentIds": [],
+    }
+
+
+def project_filter(dataset_id: int, excluded: Sequence[int] = ()) -> dict[str, Any]:
+    """The one every dashboard here wants: slice by project.
+
+    Multi-select rather than single: comparing two teams' projects is as common a question as
+    looking at one, and a single-select cannot express it.
+    """
+    return native_filter("project", "Project", dataset_id, "project_name",
+                         multi=True, excluded=excluded)
+
+
+def dashboard_metadata(filters: Sequence[dict[str, Any]]) -> str:
+    return json.dumps(
+        {
+            "native_filter_configuration": list(filters),
+            "cross_filters_enabled": False,
+        }
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Layout
 # --------------------------------------------------------------------------- #
-def layout_json(charts: Sequence[Chart], title: str) -> str:
-    """Greedily pack charts into rows of 12 columns, in Superset's v2 layout shape."""
+def layout_json(charts: Sequence[Chart], title: str, note: str | None = None) -> str:
+    """Greedily pack charts into rows of 12 columns, in Superset's v2 layout shape.
+
+    `note` is markdown placed above the first row. A dashboard whose numbers need a caveat
+    should carry the caveat, not rely on whoever reads it having read the docs.
+    """
     layout: dict[str, Any] = {
         "DASHBOARD_VERSION_KEY": "v2",
         "ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": ["GRID_ID"]},
@@ -289,6 +519,18 @@ def layout_json(charts: Sequence[Chart], title: str) -> str:
         layout["GRID_ID"]["children"].append(row_id)
 
     start_row()
+    if note:
+        node = "MARKDOWN-note"
+        layout[node] = {
+            "type": "MARKDOWN",
+            "id": node,
+            "children": [],
+            "parents": ["ROOT_ID", "GRID_ID", row_id],
+            "meta": {"width": GRID_COLUMNS, "height": 22, "code": note},
+        }
+        layout[row_id]["children"].append(node)
+        start_row()
+
     for chart in charts:
         if used + chart.width > GRID_COLUMNS:
             start_row()
@@ -412,3 +654,95 @@ def load_tags(superset: Superset) -> list[TagSchema]:
         tags.append(TagSchema(id=int(row["id"]), name=row["name"], fields=fields))
         print(f"  tag #{row['id']} {row['name']!r} -> [{', '.join(n for n, _ in fields)}]")
     return tags
+
+
+# The tag schemas a lifecycle chart can read, best first. There is no single name every
+# cluster uses: `mount_hopsworks_db` creates `asset_lifecycle`, the demo data on the
+# reference cluster carries `asset`, and older installs used `sdlc`. Hardcoding any one of
+# them is what made the analyst dashboard's status chart render empty everywhere else, with
+# no error to explain it — a tag name that does not exist is not a failure to Superset, it
+# is a join that matches nothing.
+LIFECYCLE_TAG_ORDER = ("asset_lifecycle", "asset", "sdlc", "lifecycle_status")
+
+
+def resolve_lifecycle_tag(
+    query: Callable[[str], list[dict[str, Any]]],
+    preferred: str | None = None,
+    field_name: str = "status",
+) -> str | None:
+    """The name of the lifecycle tag schema to chart, or None when the cluster has none.
+
+    `query` is anything that runs SQL and returns rows: `Superset.sql`, or a lambda over the
+    older builders' `run_sql`. Passing the callable rather than a client keeps this usable
+    from the builders that have not been ported to `Superset` yet.
+
+    An explicit `preferred` name is honoured if it exists and refused if it does not, because
+    a caller that named a tag wants that tag: silently charting a different one is worse than
+    saying the name was wrong. Without one, the first candidate that exists *and* carries the
+    field being charted wins — a schema without the field would produce the same empty chart
+    the fallback exists to avoid.
+    """
+    present = {
+        str(row["name"]): row.get("tag_schema") or ""
+        for row in query("SELECT name, tag_schema FROM feature_store_tag")
+    }
+
+    def carries_field(name: str) -> bool:
+        try:
+            properties = (json.loads(present[name]) or {}).get("properties") or {}
+        except (TypeError, ValueError):
+            return False
+        return field_name in properties
+
+    if preferred:
+        if preferred not in present:
+            raise SystemExit(
+                f"No tag schema named {preferred!r} on this cluster. "
+                f"Present: {', '.join(sorted(present)) or '(none)'}"
+            )
+        if not carries_field(preferred):
+            print(f"  ! tag {preferred!r} has no {field_name!r} field; charting it anyway")
+        return preferred
+
+    for candidate in LIFECYCLE_TAG_ORDER:
+        if candidate in present and carries_field(candidate):
+            return candidate
+    return None
+
+
+# Where a schema declares no enum. Only a fallback: a lifecycle chart built over the wrong
+# stage list is the same failure as one built over the wrong tag name, and just as quiet.
+DEFAULT_STATUS_VALUES = ("dev", "qa", "uat", "prod")
+
+# Not a lifecycle stage. An asset does not progress *to* deprecated on its way anywhere, so
+# it is excluded from funnels and promotion journeys while staying a legitimate tag value.
+TERMINAL_STATUS = "deprecated"
+
+
+def lifecycle_status_values(
+    query: Callable[[str], list[dict[str, Any]]],
+    tag_name: str,
+    field_name: str = "status",
+) -> list[str]:
+    """The status values a tag schema declares, in the order it declares them.
+
+    Declaration order is lifecycle order by convention here, and it is the only ordering
+    available: the schema records an enum, not a progression. Reading it beats a hardcoded
+    list because the two schemas in the wild disagree -- `asset` has rnd, `asset_lifecycle`
+    has dev -- and a chart built over the wrong one silently omits every asset in the stage
+    it does not know about, which reads as an empty stage rather than a missing one.
+    """
+    rows = query(
+        "SELECT tag_schema FROM feature_store_tag WHERE name = " + sql_str(tag_name)
+    )
+    if rows:
+        try:
+            properties = (json.loads(rows[0]["tag_schema"]) or {}).get("properties") or {}
+            values = (properties.get(field_name) or {}).get("enum")
+            if values:
+                return [str(v) for v in values]
+        except (TypeError, ValueError):
+            pass
+    print(f"  ! tag {tag_name!r} declares no {field_name!r} enum; "
+          f"falling back to {', '.join(DEFAULT_STATUS_VALUES)}")
+    return list(DEFAULT_STATUS_VALUES)

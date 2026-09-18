@@ -26,6 +26,8 @@ import json
 
 import hopsworks
 
+from superset import attach_charts, ensure_dataset, resolve_analytics_database
+
 SCHEMA = "hopsworks"
 DATASET_NAME = "job_runs"
 DASHBOARD_TITLE = "Jobs Activity Dashboard"
@@ -76,20 +78,13 @@ ANALYTICS_CONNECTION = "hopsworks_analytics"
 
 
 def find_mysql_db_id(api):
-    """The analytics connection, which the backend names '<connector>__<superset user>'.
+    """The analytics connection, resolved the same way every other builder resolves it.
 
-    Selecting on the mysql backend alone is not enough: a project with the online feature store also has a
-    MySQL connection, so the first match can silently be the wrong database and every chart then reads it.
+    This had its own prefix-only copy of the lookup, which preferred whichever connection came back
+    first. On a cluster still carrying the per-user connections that is routinely somebody's personal
+    one, so the shared connection existed and these dashboards were built somewhere else anyway.
     """
-    mysql_dbs = [db for db in api.list_databases()["result"]
-                 if (db.get("backend") or "").lower() == "mysql"]
-    for db in mysql_dbs:
-        if (db.get("database_name") or "").startswith(ANALYTICS_CONNECTION):
-            return db["id"], db.get("database_name")
-    raise RuntimeError(
-        f"No Superset connection named {ANALYTICS_CONNECTION}* found. "
-        f"MySQL connections present: {[db.get('database_name') for db in mysql_dbs]}"
-    )
+    return resolve_analytics_database(api)
 
 
 def run_sql(api, db_id, sql):
@@ -98,37 +93,6 @@ def run_sql(api, db_id, sql):
     r = api._request("POST", "/api/v1/sqllab/execute/", json_data=body)
     cols = [c["name"] for c in r.get("columns", [])]
     return [dict(zip(cols, [row.get(c) for c in cols])) for row in r.get("data", [])]
-
-
-def ensure_dataset(api, db_id, name, sql):
-    page, existing = 0, None
-    while True:
-        j = api._request("GET", f"/api/v1/dataset/?q=(page:{page},page_size:100)")
-        batch = j.get("result", [])
-        for ds in batch:
-            if ds.get("table_name") == name and ds.get("schema") == SCHEMA:
-                existing = ds
-                break
-        if existing or len(batch) < 100:
-            break
-        page += 1
-
-    if existing:
-        ds_id = existing["id"]
-        api.update_dataset(ds_id, sql=sql)
-        print(f"Updated existing dataset id={ds_id}")
-    else:
-        ds_id = api.create_dataset(
-            database_id=db_id, table_name=name, schema=SCHEMA, sql=sql)["id"]
-        print(f"Created dataset id={ds_id}")
-
-    # Re-introspect columns after a SQL change and disable caching so the counts
-    # stay live.
-    api._request("PUT", f"/api/v1/dataset/{ds_id}/refresh")
-    api.update_dataset(ds_id, cache_timeout=0)
-    cols = api.get_dataset(ds_id).get("result", {}).get("columns", [])
-    print(f"  synced {len(cols)} columns; cache disabled (cache_timeout=0)")
-    return ds_id
 
 
 def list_all(api, resource):
@@ -227,12 +191,32 @@ def chart_specs():
 
 
 def replace_chart(api, slice_name, viz_type, dataset_id, params):
-    for c in list_all(api, "chart"):
-        if c.get("slice_name") == slice_name:
-            api.delete_chart(c["id"])
-    return api.create_chart(
-        slice_name=slice_name, viz_type=viz_type, datasource_id=dataset_id,
-        params=json.dumps(params))["id"]
+    """Reconcile a chart by name, updating in place where one already exists.
+
+    This deleted every chart with a matching title before creating a replacement. A failure
+    between the two left the published dashboard missing charts; a success changed the chart id
+    and so dropped it out of any other dashboard reusing it; and matching on title alone gave no
+    ownership boundary against a chart somebody else had named the same. Ownership here is the
+    dataset: our title on our dataset is ours to update.
+    """
+    named = [c for c in list_all(api, "chart") if c.get("slice_name") == slice_name]
+    ours = [c for c in named if c.get("datasource_id") == dataset_id]
+    if not ours and named:
+        raise RuntimeError(
+            f"A chart named '{slice_name}' already exists on datasource(s) "
+            f"{[c.get('datasource_id') for c in named]}, not on this dashboard's dataset "
+            f"{dataset_id}. Refusing to overwrite a chart that may not be ours; rename or remove "
+            f"it and re-run.")
+    body = dict(slice_name=slice_name, viz_type=viz_type, datasource_id=dataset_id,
+                datasource_type="table", params=json.dumps(params))
+    if ours:
+        chart_id = ours[0]["id"]
+        api.update_chart(chart_id, **body)
+    else:
+        chart_id = api.create_chart(**body)["id"]
+    for dup in ours[1:]:
+        api.delete_chart(dup["id"])
+    return chart_id
 
 
 # --------------------------------------------------------------------------- #
@@ -311,8 +295,7 @@ def ensure_dashboard(api, title, charts, json_metadata):
         api.update_dashboard(dash_id, dashboard_title=title, published=True,
                              position_json=position_json, json_metadata=json_metadata)
         print(f"Updated dashboard id={dash_id}")
-    for ch in charts:
-        api.update_chart(ch["id"], dashboards=[dash_id])
+    attach_charts(api, dash_id, [ch["id"] for ch in charts])
     return dash_id
 
 
