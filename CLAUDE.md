@@ -4,7 +4,7 @@ This repo is used to build superset dashboards for Hopsworks. You should pick th
 
 The questions this setup needs answered live in `okrs.md` in the user's home directory
 (`$HOPSFS_USER_HOME_DIR`, falling back to `$HOME`). `okrs.sh` in this repo asks them in the Terminal
-and writes that file, and the Setup Analytics wizard runs it before it launches you. Read `okrs.md`
+and writes that file, and the Set up dashboards button on the analytics project's Superset page runs it before it launches you. Read `okrs.md`
 before doing anything else. Do not ask the questions yourself and do not run `okrs.sh`: it needs an
 interactive terminal, which a coding agent does not have. If the file is missing, tell the user to
 run `okrs.sh` in the Terminal and stop.
@@ -24,7 +24,7 @@ That same run also registers the 'asset_lifecycle' tag schema if it is not alrea
 
 An existing schema is left exactly as it is, archive flag included, because re-registering would mean deleting it and that cascades away every attachment across every project. If it exists without archiving, the run says so and prints the admin call to turn it on.
 
-Registering a tag schema is admin-only, which is fine here: this wizard is admin-only too.
+Registering a tag schema is admin-only, which is fine here: every member of the analytics project, where the setup runs, is an admin.
 
 The second task is to create a new feature group called okrs that will store the user's OKRs that will be shown in an 'executive dashboard'. If the okrs feature group has not been created and populated, build it from the targets table in `okrs.md`: a DataFrame with 'target' and 'value' columns, one row per target whose value is not 0, with the 'target' entries being exactly the names in the table ("features", "feature views (models)", "model deployments", "agent deployments") and the 'value' entries the numbers the user gave.
 
@@ -67,7 +67,7 @@ Run 'refresh_dashboards.py', not 'create_tag_dataset.py' directly. It runs the t
 
 An installation set up before refresh_dashboards.py existed has this job pointing at create_tag_dataset.py. It will report success on every run while the executive targets never change, and the UI cannot tell the two apart because it finds the job by name. Run 'migrate_refresh_job.py' once on such an installation: it uploads the runner and its sibling scripts next to the job's current entry point, switches the entry point, and runs the job once to confirm.
 
-Name that job exactly `update-tag-dataset`. This is a contract, not a preference: the Hopsworks UI's "Refresh Dashboard Now" action looks the job up by that literal name (ANALYTICS_TAG_JOB in hopsworks-front's `src/modules/wizard/Wizard.tsx`). Any other name and the action 404s and tells the user to run Setup Analytics first, which they will already have done. The name is now slightly narrower than what the job does, and it stays as it is because the UI depends on the literal.
+Name that job exactly `update-tag-dataset`. This is a contract, not a preference: the "Refresh dashboard data" button on the analytics project's Superset page looks the job up by that literal name (REFRESH_JOB in hopsworks-front's `src/modules/analytics-dashboards/analyticsDashboards.ts`). Any other name and the button reports that there is no update-tag-dataset job and tells the user to run the setup, which they will already have done. The name is now slightly narrower than what the job does, and it stays as it is because the UI depends on the literal.
 
 
 When `create_dashboards_now` is `yes`, create the dashboards (executive, developer, others).

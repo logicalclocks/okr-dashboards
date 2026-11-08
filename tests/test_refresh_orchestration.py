@@ -2,7 +2,7 @@
 
 Most dashboards query the analytics connection when opened, so they are live by construction. The
 executive dashboard embeds its OKR targets and duplicate-feature counts as SQL literals fixed when
-its builder runs, and the Refresh Dashboard Now job rebuilt only the tag datasets.
+its builder runs, and the refresh job used to rebuild only the tag datasets.
 """
 
 from conftest import load

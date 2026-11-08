@@ -1,6 +1,6 @@
 """Refresh every dashboard whose numbers are a snapshot rather than a live read.
 
-The Hopsworks UI's "Refresh Dashboard Now" action runs the `update-tag-dataset` job, and that
+The Hopsworks UI's "Refresh dashboard data" button runs the `update-tag-dataset` job, and that
 job used to run `create_tag_dataset.py` alone. Most dashboards are fine with that: their charts
 query the analytics connection when they are opened, so they are live by construction.
 

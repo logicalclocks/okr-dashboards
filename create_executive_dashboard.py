@@ -1167,9 +1167,9 @@ def main():
     })
     # The targets and the duplicate-feature counts on this page are SQL literals, fixed when this
     # builder runs. Editing the okrs feature group or re-running the duplicate detector does not
-    # change them, and neither does the wizard's Refresh Dashboard Now, which rebuilds the tag
-    # dashboards only. Stating when they were taken is what makes a stale number recognisable;
-    # refresh_dashboards.py re-runs this builder alongside the tag datasets.
+    # change them, and neither does a refresh job running create_tag_dataset.py alone, which
+    # rebuilds the tag dashboards only. Stating when they were taken is what makes a stale number
+    # recognisable; refresh_dashboards.py re-runs this builder alongside the tag datasets.
     taken = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     # The scan time is the detector's, not this build's: the two are separate events and a fresh
     # build of a month-old scan must not read as a month-old finding refreshed today.

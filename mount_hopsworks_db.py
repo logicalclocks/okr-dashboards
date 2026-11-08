@@ -55,7 +55,7 @@ VERSION = 1
 
 # The lifecycle tag the analytics dashboards read. Created here because this is the
 # first step of the setup flow that already has an admin's session: registering a tag
-# schema is admin-only, and the wizard that runs this is admin-only too.
+# schema is admin-only, and every member of the analytics project that runs this is an admin.
 LIFECYCLE_TAG = "asset_lifecycle"
 
 # Registered with archiving ON. Without it the tag records only its current value, so
@@ -398,8 +398,8 @@ def ensure_lifecycle_tag() -> None:
     try:
         api.create(LIFECYCLE_TAG, LIFECYCLE_SCHEMA, archive=LIFECYCLE_ARCHIVE)
     except PermissionError as e:
-        # Registering a schema is admin-only. The wizard is too, so this should not happen;
-        # say what went wrong rather than failing the whole mount over it.
+        # Registering a schema is admin-only and so is the analytics project, so this should not
+        # happen; say what went wrong rather than failing the whole mount over it.
         print(f"  ! could not create tag schema {LIFECYCLE_TAG!r}: {e}")
         return
     except Exception as exc:  # noqa: BLE001 - a tag schema must not fail the mount
@@ -509,9 +509,9 @@ def main() -> None:
             if already_exists(exc):
                 # The check above and this create are two calls, so anything creating the same
                 # feature group in between wins and this one is told it already exists. That
-                # happens for real: the setup flow is re-runnable and the wizard can be driving
-                # a second session against the same project. It is the outcome we wanted anyway,
-                # so count it as a skip. Reporting it as a failure made a healthy run look like
+                # happens for real: the setup flow is re-runnable and the Set up dashboards button
+                # can be driving a second session against the same project. It is the outcome we
+                # wanted anyway, so count it as a skip. Reporting it as a failure made a healthy run look like
                 # it had lost half the tables.
                 print(f"{prefix}: already exists (created concurrently) -> skip")
                 skipped.append(tname)

@@ -2,7 +2,7 @@
 
 Installations set up before refresh_dashboards.py existed have a job that runs
 create_tag_dataset.py alone. It reports success on every run while the executive dashboard's
-targets and duplicate counts never change, and the UI's Refresh Dashboard Now action looks the
+targets and duplicate counts never change, and the UI's Refresh dashboard data button looks the
 job up by name, so it cannot tell the old job from the new one. Changing the instructions in
 CLAUDE.md fixes new installations only.
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Ask the Setup Analytics questions in the terminal and write the answers to
+# Ask the dashboard setup questions in the terminal and write the answers to
 # okrs.md, which CLAUDE.md / AGENTS.md then tell the coding agent to read.
 #
 # The questions used to be AskUserQuestion prompts inside CLAUDE.md, which only
-# Claude Code can answer. Every agent can read a file, and the wizard runs this
+# Claude Code can answer. Every agent can read a file, and the setup runs this
 # in the Terminal before it launches the agent, so the user answers here and
 # the agent picks the answers up. The agent itself must never run this: agents
 # run shell commands without a terminal, so `read` would block forever.
@@ -15,7 +15,7 @@
 #
 # Usage: okrs.sh [path/to/okrs.md]
 #   Re-running with an existing file shows the current answers and offers to
-#   keep them, so the wizard can run it every time without forcing re-entry.
+#   keep them, so the setup can run it every time without forcing re-entry.
 set -euo pipefail
 
 out="${1:-${HOPSFS_USER_HOME_DIR:-$HOME}/okrs.md}"
@@ -66,7 +66,7 @@ ask_yes_no() {
     done
 }
 
-echo "Setup Analytics: a few questions about your OKRs for AI assets in Hopsworks"
+echo "Dashboard setup: a few questions about your OKRs for AI assets in Hopsworks"
 echo "for the current year. Enter 0 for a target you do not want to track."
 echo
 features=$(ask_number "Target total number of production features (e.g. 1000)?" 0)
