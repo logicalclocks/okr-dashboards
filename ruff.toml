@@ -1,0 +1,13 @@
+# Pinned explicitly rather than left to ruff's defaults, which widen between releases: CI
+# installing a newer ruff than the one a change was written against turned a green check red
+# with 38 findings in files nobody had touched. This is ruff's documented default set plus
+# import sorting.
+line-length = 100
+
+[lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[lint.per-file-ignores]
+# The tests import their own conftest by name, which needs the tests directory on sys.path;
+# pytest puts it there via rootdir insertion.
+"tests/*" = ["E402"]

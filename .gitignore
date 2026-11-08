@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Answers written by okrs.sh (live in the user home, never in the repo)
+okrs.md
